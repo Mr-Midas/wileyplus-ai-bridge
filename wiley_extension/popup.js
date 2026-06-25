@@ -97,7 +97,7 @@ async function typeAndGetIconCoords(tabId, text) {
   console.log("[Gemini] typeAndGetIconCoords: text length =", text.length);
   const r = await chrome.scripting.executeScript({
     target: { tabId },
-    func: (t) => {
+    func: async (t) => {
       const selectors = [
         'div[contenteditable="true"][role="textbox"]',
         'div.ql-editor[contenteditable="true"]',
@@ -111,18 +111,47 @@ async function typeAndGetIconCoords(tabId, text) {
         if (tb) break;
       }
       if (!tb) return { error: 'no_textbox' };
-      tb.focus();
-      tb.innerText = t;
-      tb.dispatchEvent(new Event('input', { bubbles: true }));
-      tb.dispatchEvent(new Event('change', { bubbles: true }));
 
-      const icon = document.querySelector('mat-icon[fonticon="arrow_upward"], [data-mat-icon-name="arrow_upward"]');
-      if (icon) {
-        const rect = icon.getBoundingClientRect();
-        console.log("[Gemini] icon found at", rect.x, rect.y, rect.width, "x", rect.height);
-        return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2, w: rect.width, h: rect.height };
+      tb.focus();
+
+      // 1. Force state update using execCommand (best for rich text frameworks)
+      document.execCommand('selectAll', false, null);
+      const success = document.execCommand('insertText', false, t);
+
+      // 2. Fallback to direct manipulation + deep events
+      if (!success) {
+        tb.innerText = t;
+        tb.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+        tb.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
       }
-      console.log("[Gemini] icon NOT found");
+
+      // 3. Wait 300ms for UI frameworks (React/Lit) to enable the send button
+      await new Promise(resolve => setTimeout(resolve, 300));
+
+      // 4. Find the button coordinates using modernized selectors
+      const btnSelectors = [
+        'button[aria-label="Send message"]',
+        'button[aria-label="Send"]',
+        'button[mattooltip="Send message"]',
+        '[data-testid="send-button"]',
+        '.send-button',
+        'mat-icon[fonticon="send"]',
+        'mat-icon[fonticon="arrow_upward"]',
+        '[data-mat-icon-name="send"]',
+        '[data-mat-icon-name="arrow_upward"]',
+        'svg.send-icon'
+      ];
+
+      for (const sel of btnSelectors) {
+        const iconOrBtn = document.querySelector(sel);
+        if (iconOrBtn) {
+          const rect = iconOrBtn.getBoundingClientRect();
+          console.log("[Gemini] Target found via", sel, "at", rect.x, rect.y);
+          return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2, w: rect.width, h: rect.height, selector: sel };
+        }
+      }
+
+      console.log("[Gemini] Target NOT found");
       return { error: 'no_icon' };
     },
     args: [text]
@@ -225,17 +254,47 @@ async function clickGeminiSendDom(tabId) {
   const r = await chrome.scripting.executeScript({
     target: { tabId },
     func: () => {
-      const touchTarget = document.querySelector('span.mat-mdc-button-touch-target');
-      if (touchTarget) {
-        const btn = touchTarget.closest('button');
-        if (btn) { btn.click(); return 'clicked_touch'; }
+      const btnSelectors = [
+        'button[aria-label="Send message"]',
+        'button[aria-label="Send"]',
+        'button[mattooltip="Send message"]',
+        '[data-testid="send-button"]',
+        '.send-button'
+      ];
+      
+      for (const sel of btnSelectors) {
+        const btn = document.querySelector(sel);
+        if (btn) {
+          if (btn.disabled || btn.getAttribute('aria-disabled') === 'true') {
+             return 'found_but_disabled:' + sel;
+          }
+          btn.click();
+          return 'clicked_button:' + sel;
+        }
       }
-      const icon = document.querySelector('mat-icon[fonticon="arrow_upward"], [data-mat-icon-name="arrow_upward"]');
-      if (icon) {
-        const btn = icon.closest('button');
-        if (btn) { btn.click(); return 'clicked_button'; }
-        icon.parentElement?.click();
-        return 'clicked_parent';
+
+      const iconSelectors = [
+        'mat-icon[fonticon="send"]',
+        'mat-icon[fonticon="arrow_upward"]',
+        '[data-mat-icon-name="send"]',
+        '[data-mat-icon-name="arrow_upward"]',
+        'svg.send-icon'
+      ];
+      
+      for (const sel of iconSelectors) {
+        const icon = document.querySelector(sel);
+        if (icon) {
+          const btn = icon.closest('button');
+          if (btn) {
+            if (btn.disabled || btn.getAttribute('aria-disabled') === 'true') {
+               return 'found_icon_btn_but_disabled:' + sel;
+            }
+            btn.click();
+            return 'clicked_button_via_icon:' + sel;
+          }
+          icon.click();
+          return 'clicked_icon_fallback:' + sel;
+        }
       }
       return 'not_found';
     }
@@ -245,14 +304,26 @@ async function clickGeminiSendDom(tabId) {
 
 async function sendToGemini(tabId, x, y) {
   console.log("[Gemini] sendToGemini: starting");
+  
+  // Give the framework an extra moment to hydrate just in case
+  await new Promise(r => setTimeout(r, 200));
+
   // Phase 1: DOM click
   const domResult = await clickGeminiSendDom(tabId);
   console.log("[Gemini] DOM click result:", domResult);
+
+  if (domResult.includes('but_disabled')) {
+      console.warn("[Gemini] WARNING: Button was disabled. Prompt might not be registered by the UI.");
+  }
+
   // Phase 2: Focus textbox
   await focusGeminiTextbox(tabId);
+
   // Phase 3: CDP combo (focus → Enter → mouse click × 2)
+  // This acts as a brute-force fallback to ensure the request goes through even if the DOM click failed.
   const cdpResult = await cdpSendCombo(tabId, x, y);
   console.log("[Gemini] CDP combo result:", cdpResult);
+
   const success = domResult?.startsWith('clicked') || cdpResult !== 'attach_failed';
   console.log("[Gemini] sendToGemini: overall success =", success);
   return success;
