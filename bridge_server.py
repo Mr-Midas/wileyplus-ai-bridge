@@ -99,19 +99,27 @@ async def call_gemini_web(prompt_text):
         print("[Playwright] ERROR: No textbox found")
         return None
 
-    # Type prompt using locator (re-queryable, handles DOM re-renders)
+    # Inject text instantly via evaluate (most reliable for rich text editors)
     textbox = gemini_page.locator(textbox_selector).first
     await textbox.click()
     await asyncio.sleep(0.3)
-    await textbox.fill("")
-    await asyncio.sleep(0.1)
-    # Type in chunks to avoid timeout
-    chunk_size = 500
-    for i in range(0, len(prompt_text), chunk_size):
-        chunk = prompt_text[i:i+chunk_size]
-        await textbox.type(chunk, delay=5)
-        await asyncio.sleep(0.05)
-    print(f"[Playwright] Typed prompt ({len(prompt_text)} chars)")
+    # Use page-level evaluate to set text and trigger events
+    await gemini_page.evaluate("""(args) => {
+        const [selector, text] = args;
+        const el = document.querySelector(selector);
+        if (!el) return;
+        el.focus();
+        el.textContent = text;
+        // Trigger all the events React/Gemini listens for
+        el.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+        el.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
+        el.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true, composed: true }));
+        // Also try execCommand for framework state
+        document.execCommand('selectAll');
+        document.execCommand('insertText', false, text);
+    }""", [textbox_selector, prompt_text])
+    await asyncio.sleep(1)
+    print(f"[Playwright] Injected prompt ({len(prompt_text)} chars)")
     await asyncio.sleep(1)
 
     # Find and click send button using locators
