@@ -1,13 +1,12 @@
 {
   "manifest_version": 3,
   "name": "WileyPLUS AI Bridge",
-  "version": "1.0",
-  "description": "Sends WileyPLUS content to local AI agent",
+  "version": "2.0",
+  "description": "Sends WileyPLUS content to local AI agent via Playwright",
   "permissions": [
     "activeTab",
     "scripting",
-    "storage",
-    "debugger"
+    "storage"
   ],
   "content_scripts": [
     {

@@ -1,6 +1,7 @@
 import os
 import re
 import json
+import asyncio
 import requests
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -13,12 +14,189 @@ GEMINI_KEY = os.getenv("GEMINI_API_KEY")
 GROQ_KEY = os.getenv("GROQ_API_KEY")
 OLLAMA_ENDPOINT = "http://127.0.0.1:11434/api/generate"
 GROQ_ENDPOINT = "https://api.groq.com/openai/v1/chat/completions"
+GEMINI_WEB_URL = "https://gemini.google.com/app/a4cd531f81f6f26d"
 
 if GEMINI_KEY:
     genai.configure(api_key=GEMINI_KEY)
 
 app = Flask(__name__)
 CORS(app)
+
+# Playwright browser instance (persistent)
+_pw_browser = None
+_pw_context = None
+
+async def get_playwright_browser():
+    global _pw_browser, _pw_context
+    if _pw_browser and _pw_browser.is_connected():
+        return _pw_browser, _pw_context
+    from playwright.async_api import async_playwright
+    pw = await async_playwright().start()
+    _pw_browser = await pw.chromium.launch(headless=False)
+    _pw_context = await _pw_browser.new_context()
+    print("[Playwright] Browser launched")
+    return _pw_browser, _pw_context
+
+async def call_gemini_web(prompt_text):
+    """Use Playwright to interact with Gemini web UI."""
+    import asyncio
+    browser, context = await get_playwright_browser()
+
+    # Find or create Gemini tab
+    pages = context.pages
+    gemini_page = None
+    for p in pages:
+        if "gemini.google.com" in p.url:
+            gemini_page = p
+            break
+    if not gemini_page:
+        gemini_page = await context.new_page()
+        await gemini_page.goto(GEMINI_WEB_URL, wait_until="domcontentloaded")
+        print("[Playwright] Opened new Gemini tab")
+    else:
+        print("[Playwright] Reusing existing Gemini tab:", gemini_page.url)
+
+    # Wait for textbox
+    textbox_selector = None
+    for attempt in range(20):
+        selectors = [
+            'div[contenteditable="true"][role="textbox"]',
+            'rich-textarea div[contenteditable="true"]',
+            'div[contenteditable="true"]'
+        ]
+        for sel in selectors:
+            count = await gemini_page.locator(sel).count()
+            if count > 0:
+                textbox_selector = sel
+                break
+        if textbox_selector:
+            break
+        print(f"[Playwright] Waiting for textbox... attempt {attempt+1}")
+        await asyncio.sleep(1)
+
+    if not textbox_selector:
+        print("[Playwright] ERROR: No textbox found")
+        return None
+
+    # Type prompt using locator (re-queryable, handles DOM re-renders)
+    textbox = gemini_page.locator(textbox_selector).first
+    await textbox.click()
+    await asyncio.sleep(0.3)
+    await textbox.fill("")
+    await asyncio.sleep(0.1)
+    # Type in chunks to avoid timeout
+    chunk_size = 500
+    for i in range(0, len(prompt_text), chunk_size):
+        chunk = prompt_text[i:i+chunk_size]
+        await textbox.type(chunk, delay=5)
+        await asyncio.sleep(0.05)
+    print(f"[Playwright] Typed prompt ({len(prompt_text)} chars)")
+    await asyncio.sleep(1)
+
+    # Find and click send button using locators
+    send_selectors = [
+        'button[aria-label="Send message"]',
+        'button[aria-label="Send"]',
+        '[data-testid="send-button"]',
+        'mat-icon[fonticon="arrow_upward"]',
+        '[data-mat-icon-name="arrow_upward"]',
+        'mat-icon[fonticon="send"]',
+        '[data-mat-icon-name="send"]'
+    ]
+    sent = False
+    for sel in send_selectors:
+        try:
+            count = await gemini_page.locator(sel).count()
+            if count > 0:
+                el = gemini_page.locator(sel).first
+                # Check if it's a button or inside a button
+                tag = await el.evaluate("e => e.tagName.toLowerCase()")
+                if tag != "button":
+                    btn = gemini_page.locator(f"{sel} >> xpath=ancestor::button").first
+                else:
+                    btn = el
+                # Check disabled state
+                is_disabled = await btn.evaluate("e => e.disabled || e.getAttribute('aria-disabled') === 'true'")
+                if is_disabled:
+                    print(f"[Playwright] Button found via {sel} but DISABLED, waiting...")
+                    await asyncio.sleep(2)
+                await btn.click(timeout=5000)
+                sent = True
+                print(f"[Playwright] Clicked send via: {sel}")
+                break
+        except Exception as e:
+            print(f"[Playwright] Selector {sel} failed: {e}")
+            continue
+
+    if not sent:
+        # Fallback: press Enter
+        print("[Playwright] No send button found, pressing Enter")
+        textbox = gemini_page.locator(textbox_selector).first
+        await textbox.press("Enter")
+
+    # Wait for response with JSON
+    print("[Playwright] Waiting for response...")
+    json_text = None
+    for attempt in range(60):  # 60 x 2s = 120s max
+        await asyncio.sleep(2)
+        try:
+            # Check for code block with answers
+            code_block_count = await gemini_page.locator('code[data-test-id="code-content"]').count()
+            if code_block_count > 0:
+                text = await gemini_page.locator('code[data-test-id="code-content"]').first.inner_text()
+                if '"answers"' in text:
+                    json_text = text
+                    print(f"[Playwright] Found JSON in code block (attempt {attempt+1})")
+                    break
+
+            # Check body text for JSON
+            body_text = await gemini_page.inner_text("body")
+            match = re.search(r'\{[\s\S]*"answers"[\s\S]*\}', body_text)
+            if match:
+                json_text = match.group(0)
+                print(f"[Playwright] Found JSON in body text (attempt {attempt+1})")
+                break
+
+            if attempt % 5 == 0:
+                print(f"[Playwright] Waiting for response... attempt {attempt+1}")
+        except Exception as e:
+            print(f"[Playwright] Check error: {e}")
+
+    if not json_text:
+        print("[Playwright] ERROR: No JSON response after 120s")
+        return None
+
+    # Parse JSON
+    try:
+        # Try direct parse
+        data = json.loads(json_text)
+        if "answers" in data:
+            return data
+    except json.JSONDecodeError:
+        pass
+
+    # Try extracting JSON from markdown code block
+    match = re.search(r'```json\s*([\s\S]*?)```', json_text)
+    if match:
+        try:
+            data = json.loads(match.group(1).strip())
+            if "answers" in data:
+                return data
+        except json.JSONDecodeError:
+            pass
+
+    # Try brace match
+    match = re.search(r'\{[\s\S]*\}', json_text)
+    if match:
+        try:
+            data = json.loads(match.group(0))
+            if "answers" in data:
+                return data
+        except json.JSONDecodeError:
+            pass
+
+    print("[Playwright] ERROR: Could not parse JSON:", json_text[:300])
+    return None
 
 def clean_answers(answers):
     cleaned = []
@@ -227,9 +405,34 @@ Rules:
         return jsonify(result)
     return jsonify({"error": "All retry models failed", "action": "failed"}), 500
 
+@app.route('/gemini-web', methods=['POST'])
+def gemini_web():
+    """Proxy to Gemini web via Playwright. Sends prompt, returns JSON."""
+    data = request.json
+    prompt_text = data.get('prompt', '')
+    if not prompt_text:
+        return jsonify({"error": "No prompt"}), 400
+
+    print(f"[Server] /gemini-web request, prompt length={len(prompt_text)}")
+    try:
+        result = asyncio.run(call_gemini_web(prompt_text))
+        if result:
+            print(f"[Server] /gemini-web success, answers={len(result.get('answers', []))}")
+            return jsonify(result)
+        else:
+            print("[Server] /gemini-web returned None")
+            return jsonify({"error": "Gemini web returned no JSON"}), 500
+    except Exception as e:
+        print(f"[Server] /gemini-web error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/', methods=['GET'])
+def health():
+    return jsonify({"status": "ok", "version": "7.0"})
+
 if __name__ == "__main__":
     print("="*50)
-    print(" WILEY BRIDGE v6.1 (Smart Escalation)")
-    print(" Priority: Gemini 2.0 Flash -> Groq -> Gemini Flash -> Local")
+    print(" WILEY BRIDGE v7.0 (Playwright Gemini)")
+    print(" Endpoints: /solve, /retry, /gemini-web, /")
     print("="*50)
     app.run(host='127.0.0.1', port=5000)
