@@ -2,6 +2,43 @@ let autoNextEnabled = false;
 let geminiTabId = null;
 const GEMINI_URL = 'https://gemini.google.com/app/a4cd531f81f6f26d';
 
+// --- UI Helpers (countdown + step bar) ---
+
+function setStep(stepNum, state) {
+  for (let i = 1; i <= 6; i++) {
+    const el = document.getElementById('step' + i);
+    if (!el) continue;
+    el.className = 'step';
+    if (i < stepNum) el.classList.add('done');
+    else if (i === stepNum) el.classList.add(state || 'active');
+  }
+  const labels = ['', 'Opening Gemini', 'Waiting for page', 'Typing prompt', 'Sending prompt', 'Waiting for response', 'Reading JSON'];
+  const labelEl = document.getElementById('stepLabel');
+  if (labelEl) labelEl.textContent = stepNum > 0 && stepNum <= 6 ? labels[stepNum] : '';
+}
+
+async function countdown(seconds, label) {
+  const el = document.getElementById('countdown');
+  const status = document.getElementById('status');
+  for (let i = seconds; i > 0; i--) {
+    if (el) el.textContent = `${label}: ${i}s`;
+    if (status) status.innerText = `${label} (${i}s remaining)...`;
+    await new Promise(r => setTimeout(r, 1000));
+  }
+  if (el) el.textContent = '';
+}
+
+function clearUI() {
+  const el = document.getElementById('countdown');
+  const labelEl = document.getElementById('stepLabel');
+  if (el) el.textContent = '';
+  if (labelEl) labelEl.textContent = '';
+  for (let i = 1; i <= 6; i++) {
+    const step = document.getElementById('step' + i);
+    if (step) step.className = 'step';
+  }
+}
+
 // --- Gemini Web helpers ---
 
 function extractJSON(text) {
@@ -428,19 +465,24 @@ async function callGeminiWeb(problemText, inputCount, retryContext, wileyTabId) 
     console.log("[Gemini] Using tab ID:", tabId);
   } catch (e) {
     console.log("[Gemini] Could not get/create Gemini tab:", e.message);
+    clearUI();
     return null;
   }
   try {
     // STEP 1: Activate Gemini tab
+    setStep(1, 'active');
     console.log("[Gemini] STEP 1: Activating Gemini tab...");
     await chrome.tabs.update(tabId, { active: true });
 
     // STEP 2: Wait for page to be ready (textbox exists)
+    setStep(2, 'active');
     console.log("[Gemini] STEP 2: Waiting for page ready...");
+    await countdown(3, 'Waiting for Gemini page to load');
     await waitForGeminiReady(tabId);
     console.log("[Gemini] Page ready");
 
     // STEP 3: Type the prompt
+    setStep(3, 'active');
     let prompt;
     if (retryContext) {
       prompt = `The answers you gave for this problem were checked and some were marked incorrect. Fix only the wrong ones.
@@ -476,14 +518,17 @@ ${problemText}`;
     const coords = await typeAndGetIconCoords(tabId, prompt);
     if (coords?.error === 'no_textbox') {
       console.log("[Gemini] Textbox not found — cannot proceed");
+      setStep(3, 'error');
+      clearUI();
       return null;
     }
 
     // STEP 4: Wait 5s, confirm page is fully loaded. Retry if not.
+    setStep(4, 'active');
     console.log("[Gemini] STEP 4: Waiting 5s then confirming page ready...");
+    await countdown(5, 'Confirming prompt typed');
     let pageReady = false;
     for (let attempt = 1; attempt <= 5; attempt++) {
-      await new Promise(r => setTimeout(r, 5000));
       const check = await chrome.scripting.executeScript({
         target: { tabId },
         func: () => {
@@ -499,9 +544,12 @@ ${problemText}`;
         break;
       }
       console.log("[Gemini] Page not ready yet, waiting 5s more...");
+      await countdown(5, 'Retrying page check');
     }
     if (!pageReady) {
       console.log("[Gemini] Page never became ready after 5 attempts");
+      setStep(4, 'error');
+      clearUI();
       return null;
     }
 
@@ -515,14 +563,17 @@ ${problemText}`;
       await sendToGemini(tabId, coords.x, coords.y);
     } else {
       console.log("[Gemini] No coordinates, skipping send");
+      setStep(5, 'error');
+      clearUI();
       return null;
     }
 
-    // STEP 6: Wait 5s, confirm JSON text box appeared. Retry if not.
-    console.log("[Gemini] STEP 6: Waiting 5s then checking for JSON box...");
+    // STEP 6: Wait for JSON response
+    setStep(6, 'active');
+    console.log("[Gemini] STEP 6: Waiting for JSON response...");
     let jsonText = null;
     for (let attempt = 1; attempt <= 24; attempt++) {
-      await new Promise(r => setTimeout(r, 5000));
+      await countdown(5, 'Waiting for Gemini response');
       const check = await chrome.scripting.executeScript({
         target: { tabId },
         func: () => {
@@ -558,22 +609,28 @@ ${problemText}`;
         console.log("[Gemini] JSON box confirmed, text length:", jsonText.length);
         break;
       }
-      console.log("[Gemini] JSON not found yet, waiting 5s more...");
+      console.log("[Gemini] JSON not found yet, waiting...");
     }
 
     if (!jsonText) {
       console.log("[Gemini] JSON box never appeared after 24 attempts (120s)");
+      setStep(6, 'error');
+      clearUI();
       return null;
     }
 
-    // STEP 7: Copy the JSON (already have it from step 6)
+    // STEP 7: Parse the JSON
     console.log("[Gemini] STEP 7: JSON copied, parsing...");
     const data = extractJSON(jsonText);
     if (data && data.answers) {
       console.log("[Gemini] Parsed OK, answers count:", data.answers.length);
+      setStep(6, 'done');
+      setTimeout(clearUI, 1500);
       return data;
     }
     console.log("[Gemini] Could not parse JSON from response. Preview:", jsonText.substring(0, 500));
+    setStep(6, 'error');
+    clearUI();
     return null;
     } finally {
       // STEP 8: Switch back to Wiley - with robust retry logic

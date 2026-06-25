@@ -2,7 +2,7 @@
 <html>
 <head>
   <style>
-    body { width: 320px; font-family: sans-serif; padding: 10px; margin: 0; }
+    body { width: 340px; font-family: sans-serif; padding: 10px; margin: 0; }
     h3 { margin: 0 0 6px 0; font-size: 14px; }
     .status { font-size: 11px; color: #666; margin-bottom: 8px; text-align: center; }
     .btn { background: #007bff; color: white; border: none; padding: 10px; width: 100%; cursor: pointer; border-radius: 4px; font-weight: bold; font-size: 13px; }
@@ -19,11 +19,28 @@
     .dot { width: 8px; height: 8px; border-radius: 50%; background: #ccc; }
     .dot.green { background: #28a745; }
     .dot.red { background: #dc3545; }
+    .step-bar { display: flex; gap: 3px; margin: 6px 0; }
+    .step { flex: 1; height: 4px; background: #ddd; border-radius: 2px; transition: background 0.3s; }
+    .step.active { background: #007bff; }
+    .step.done { background: #28a745; }
+    .step.error { background: #dc3545; }
+    .countdown { font-size: 18px; font-weight: bold; color: #007bff; text-align: center; margin: 4px 0; font-family: monospace; }
+    .step-label { font-size: 10px; color: #007bff; text-align: center; margin-bottom: 2px; }
   </style>
 </head>
 <body>
   <h3>Wiley AI Agent</h3>
   <div class="status" id="status">Ready to solve</div>
+  <div class="step-bar" id="stepBar">
+    <div class="step" id="step1"></div>
+    <div class="step" id="step2"></div>
+    <div class="step" id="step3"></div>
+    <div class="step" id="step4"></div>
+    <div class="step" id="step5"></div>
+    <div class="step" id="step6"></div>
+  </div>
+  <div class="step-label" id="stepLabel"></div>
+  <div class="countdown" id="countdown"></div>
   <div class="status-row">
     <span class="dot" id="serverDot"></span>
     <span id="serverLabel">Server: checking...</span>
