@@ -591,11 +591,7 @@ async function checkServerAlive() {
 
 async function callGroqDirect(text, inputCount, retryContext) {
   let key = await new Promise(res => chrome.storage.local.get('groqKey', d => res(d.groqKey || '')));
-  if (!key) key = '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';
-  if (!await new Promise(res => chrome.storage.local.get('groqKey', d => res(d.groqKey)))) {
-    safeStorageSet({ groqKey: key });
-  }
-  if (!key) { console.log("[Groq] No API key saved"); return null; }
+  if (!key) { console.log("[Groq] No API key. Set via: chrome.storage.local.set({groqKey:'your_key'})"); return null; }
   console.log("[Groq] Calling Groq API directly...");
   const systemMsg = retryContext
     ? `The answers you gave were checked and some were marked incorrect. Fix only the wrong ones. Previous answers: ${JSON.stringify(retryContext.previousAnswers)}. Feedback: ${retryContext.feedbackText}. Return EXACTLY ${inputCount} answers. Return ONLY JSON: {"answers":[{"value":"number","unit":"unit"},...]}`
