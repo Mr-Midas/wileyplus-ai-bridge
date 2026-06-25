@@ -3,7 +3,13 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
+
+# Environment / secrets
 .env
+.env.*
+!.env.example
+*.pem
+*.key
 
 # Chrome extension build
 automation profile
@@ -16,3 +22,6 @@ automation_profile/
 # OS
 .DS_Store
 Thumbs.db
+
+# Opencode
+.opencode/
