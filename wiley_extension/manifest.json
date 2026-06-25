@@ -1,0 +1,27 @@
+{
+  "manifest_version": 3,
+  "name": "WileyPLUS AI Bridge",
+  "version": "1.0",
+  "description": "Sends WileyPLUS content to local AI agent",
+  "permissions": [
+    "activeTab",
+    "scripting",
+    "storage",
+    "debugger"
+  ],
+  "content_scripts": [
+    {
+      "matches": ["https://*.wiley.com/*"],
+      "js": ["content.js"],
+      "all_frames": true
+    }
+  ],
+  "host_permissions": [
+    "http://127.0.0.1/*",
+    "https://*.wiley.com/*",
+    "https://gemini.google.com/*"
+  ],
+  "action": {
+    "default_popup": "popup.html"
+  }
+}

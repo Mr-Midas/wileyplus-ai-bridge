@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <style>
+    body { width: 320px; font-family: sans-serif; padding: 10px; margin: 0; }
+    h3 { margin: 0 0 6px 0; font-size: 14px; }
+    .status { font-size: 11px; color: #666; margin-bottom: 8px; text-align: center; }
+    .btn { background: #007bff; color: white; border: none; padding: 10px; width: 100%; cursor: pointer; border-radius: 4px; font-weight: bold; font-size: 13px; }
+    .btn:disabled { background: #ccc; }
+    #result { margin-top: 8px; font-size: 12px; white-space: pre-wrap; max-height: 300px; overflow-y: auto; border: 1px solid #ddd; padding: 6px; display: none; }
+    .toggle-row { display: flex; align-items: center; justify-content: space-between; margin: 8px 0; font-size: 12px; }
+    .switch { position: relative; display: inline-block; width: 36px; height: 20px; }
+    .switch input { opacity: 0; width: 0; height: 0; }
+    .slider { position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0; background: #ccc; border-radius: 20px; transition: .3s; }
+    .slider:before { position: absolute; content: ""; height: 14px; width: 14px; left: 3px; bottom: 3px; background: white; border-radius: 50%; transition: .3s; }
+    input:checked + .slider { background: #007bff; }
+    input:checked + .slider:before { transform: translateX(16px); }
+    .status-row { display: flex; align-items: center; gap: 6px; margin: 6px 0; font-size: 11px; color: #888; }
+    .dot { width: 8px; height: 8px; border-radius: 50%; background: #ccc; }
+    .dot.green { background: #28a745; }
+    .dot.red { background: #dc3545; }
+  </style>
+</head>
+<body>
+  <h3>Wiley AI Agent</h3>
+  <div class="status" id="status">Ready to solve</div>
+  <div class="status-row">
+    <span class="dot" id="serverDot"></span>
+    <span id="serverLabel">Server: checking...</span>
+  </div>
+  <div class="toggle-row">
+    <span>Auto-next question</span>
+    <label class="switch">
+      <input type="checkbox" id="autoNextToggle">
+      <span class="slider"></span>
+    </label>
+  </div>
+  <button id="solveBtn" class="btn">Solve Problem</button>
+  <button id="debugBtn" class="btn" style="background:#6c757d; margin-top:6px;">Debug Page (Inspect Selectors)</button>
+  <div id="result"></div>
+  <script src="popup.js"></script>
+</body>
+</html>
