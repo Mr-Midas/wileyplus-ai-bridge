@@ -25,17 +25,38 @@ CORS(app)
 # Playwright browser instance (persistent)
 _pw_browser = None
 _pw_context = None
+_pw = None
+
+CHROME_USER_DATA = r"C:\Users\thome\AppData\Local\Google\Chrome\User Data"
+CHROME_CDP_URL = "http://127.0.0.1:9222"
 
 async def get_playwright_browser():
-    global _pw_browser, _pw_context
+    global _pw_browser, _pw_context, _pw
     if _pw_browser and _pw_browser.is_connected():
         return _pw_browser, _pw_context
+
     from playwright.async_api import async_playwright
-    pw = await async_playwright().start()
-    _pw_browser = await pw.chromium.launch(headless=False)
-    _pw_context = await _pw_browser.new_context()
-    print("[Playwright] Browser launched")
-    return _pw_browser, _pw_context
+
+    # Try connecting to Chrome via CDP first (launched by run.bat)
+    if _pw is None:
+        _pw = await async_playwright().start()
+
+    try:
+        _pw_browser = await _pw.chromium.connect_over_cdp(CHROME_CDP_URL)
+        # Use the default context (first one) which has the user's login
+        if _pw_browser.contexts:
+            _pw_context = _pw_browser.contexts[0]
+        else:
+            _pw_context = await _pw_browser.new_context()
+        print(f"[Playwright] Connected to Chrome via CDP at {CHROME_CDP_URL}")
+        return _pw_browser, _pw_context
+    except Exception as e:
+        print(f"[Playwright] CDP connection failed: {e}")
+        print("[Playwright] Launching new Chromium instance (you may need to log in manually)")
+        _pw_browser = await _pw.chromium.launch(headless=False)
+        _pw_context = await _pw_browser.new_context()
+        print("[Playwright] New browser launched")
+        return _pw_browser, _pw_context
 
 async def call_gemini_web(prompt_text):
     """Use Playwright to interact with Gemini web UI."""
