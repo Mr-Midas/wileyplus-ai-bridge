@@ -1,7 +1,6 @@
 let autoNextEnabled = false;
 
 // --- UI Helpers ---
-
 function setStep(stepNum, state) {
   for (let i = 1; i <= 6; i++) {
     const el = document.getElementById('step' + i);
@@ -10,81 +9,38 @@ function setStep(stepNum, state) {
     if (i < stepNum) el.classList.add('done');
     else if (i === stepNum) el.classList.add(state || 'active');
   }
-  const labels = ['', 'Scraping page', 'Sending to AI', 'Waiting for AI', 'Parsing response', 'Filling answers', 'Submitting'];
-  const labelEl = document.getElementById('stepLabel');
-  if (labelEl) labelEl.textContent = stepNum > 0 && stepNum <= 6 ? labels[stepNum] : '';
-}
-
-async function countdown(seconds, label) {
-  const el = document.getElementById('countdown');
-  const status = document.getElementById('status');
-  for (let i = seconds; i > 0; i--) {
-    if (el) el.textContent = `${label}: ${i}s`;
-    if (status) status.innerText = `${label} (${i}s remaining)...`;
-    await new Promise(r => setTimeout(r, 1000));
-  }
-  if (el) el.textContent = '';
 }
 
 function clearUI() {
-  const el = document.getElementById('countdown');
-  const labelEl = document.getElementById('stepLabel');
-  if (el) el.textContent = '';
-  if (labelEl) labelEl.textContent = '';
   for (let i = 1; i <= 6; i++) {
     const step = document.getElementById('step' + i);
     if (step) step.className = 'step';
   }
 }
 
-function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
-
-function extractJSON(text) {
-  if (!text) return null;
-  try { return JSON.parse(text); } catch {}
-  const jsonBlock = text.match(/```json\s*([\s\S]*?)```/);
-  if (jsonBlock) { try { return JSON.parse(jsonBlock[1].trim()); } catch {} }
-  const codeBlock = text.match(/```\s*([\s\S]*?)```/);
-  if (codeBlock) { try { return JSON.parse(codeBlock[1].trim()); } catch {} }
-  const braceMatch = text.match(/\{[\s\S]*\}/);
-  if (braceMatch) { try { return JSON.parse(braceMatch[0]); } catch {} }
-  return null;
-}
-
-function safeStorageSet(obj) {
-  try { chrome.storage.local.set(obj); } catch {}
-}
-
-// --- Scraper (aggressive, with unit options) ---
-
+// --- Scraper & Fill Logic ---
 async function scrapeFullState(tab) {
   console.log("[Scrape] scrapeFullState: tab =", tab.url);
   const results = await chrome.scripting.executeScript({
     target: { tabId: tab.id, allFrames: true },
     func: () => {
-      // Get visible text/number inputs
-      const inputs = Array.from(document.querySelectorAll(
-        'input[type="text"]:not([readonly]):not([hidden]), input[type="number"]:not([readonly]):not([hidden])'
-      )).filter(inp => {
-        const id = (inp.id || '').toLowerCase();
-        const cls = (inp.className || '').toLowerCase();
-        return !id.includes('search') && !cls.includes('search');
-      });
+      // Get Inputs (ignore search bars)
+      const inputs = Array.from(document.querySelectorAll('input[type="text"]:not([readonly]):not([hidden]), input[type="number"]:not([readonly]):not([hidden])'))
+        .filter(inp => !inp.id.toLowerCase().includes('search') && !inp.className.toLowerCase().includes('search'));
 
-      // Get dropdown unit options
-      const selects = Array.from(document.querySelectorAll('select:not([hidden])'));
+      // Get Dropdown Units (Removed :not([hidden]) to catch React/MUI hidden selects)
+      const selects = Array.from(document.querySelectorAll('select'));
       const selectOptions = selects.map(sel =>
         Array.from(sel.options)
           .map(o => o.textContent.trim())
           .filter(t => t && t.toLowerCase() !== 'select an option' && t !== '---' && t !== '')
       );
 
-      // Aggressively check for wrong/invalid indicators
+      // Aggressively check for Wrong/Invalid Indicators
       const states = inputs.map(inp => {
         const parent = inp.closest('label, div, td, tr, .question-content');
         const invalidAttr = inp.getAttribute('aria-invalid') === 'true';
 
-        // Search surrounding HTML for error flags
         const html = parent ? parent.innerHTML.toLowerCase() : inp.outerHTML.toLowerCase();
         const hasWrongIcon = html.includes('fa-times') || html.includes('incorrect') || html.includes('wrong') || html.includes('error');
         const classInvalid = /invalid|incorrect|wrong|error/i.test(inp.className) || (parent && /invalid|incorrect|wrong|error/i.test(parent.className));
@@ -127,32 +83,36 @@ async function scrapeFullState(tab) {
   };
 }
 
-// --- Fill Answers ---
-
 async function fillAnswers(tab, answers) {
   await chrome.scripting.executeScript({
     target: { tabId: tab.id, allFrames: true },
     func: (ans) => {
-      const numberInputs = Array.from(document.querySelectorAll(
-        'input[type="text"]:not([readonly]):not([hidden]), input[type="number"]:not([readonly]):not([hidden])'
-      )).filter(inp => {
-        const id = (inp.id || '').toLowerCase();
-        const cls = (inp.className || '').toLowerCase();
-        return !id.includes('search') && !cls.includes('search');
-      });
-      const unitSelects = Array.from(document.querySelectorAll('select:not([hidden])'));
+      const numberInputs = Array.from(document.querySelectorAll('input[type="text"]:not([readonly]):not([hidden]), input[type="number"]:not([readonly]):not([hidden])'))
+        .filter(inp => !inp.id.toLowerCase().includes('search') && !inp.className.toLowerCase().includes('search'));
+      const unitSelects = Array.from(document.querySelectorAll('select')); // Catch hidden selects
 
       ans.forEach((a, i) => {
+        // Fill Text/Number Value
         if (numberInputs[i] && a.correct !== true) {
-          numberInputs[i].value = a.value;
+          // React Native Value Setter bypass
+          const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
+          if (nativeInputValueSetter) nativeInputValueSetter.call(numberInputs[i], a.value);
+          else numberInputs[i].value = a.value;
+
           numberInputs[i].dispatchEvent(new Event('input', { bubbles: true }));
           numberInputs[i].dispatchEvent(new Event('change', { bubbles: true }));
         }
+
+        // Fill Dropdown Unit
         if (unitSelects[i] && a.correct !== true) {
-          const opt = Array.from(unitSelects[i].options).find(o => o.textContent.trim().toLowerCase() === String(a.unit).toLowerCase());
+          const opt = Array.from(unitSelects[i].options).find(o => o.textContent.trim().toLowerCase() === String(a.unit).trim().toLowerCase());
           if (opt) {
-            unitSelects[i].value = opt.value;
+            const nativeSelectValueSetter = Object.getOwnPropertyDescriptor(window.HTMLSelectElement.prototype, "value").set;
+            if (nativeSelectValueSetter) nativeSelectValueSetter.call(unitSelects[i], opt.value);
+            else unitSelects[i].value = opt.value;
+
             unitSelects[i].dispatchEvent(new Event('change', { bubbles: true }));
+            unitSelects[i].dispatchEvent(new Event('input', { bubbles: true }));
           }
         }
       });
@@ -161,21 +121,8 @@ async function fillAnswers(tab, answers) {
   });
 }
 
-async function checkInputsFilled(tab) {
-  const r = await chrome.scripting.executeScript({
-    target: { tabId: tab.id, allFrames: true },
-    func: () => {
-      const inputs = Array.from(document.querySelectorAll('input[aria-label="Enter your answer"]'));
-      return inputs.every(inp => inp.value && inp.value.trim() !== '');
-    }
-  });
-  return r.some(rr => rr.result === true);
-}
-
-// --- Server calls ---
-
+// --- Server & API Calls ---
 async function callServerSolve(text, inputCount, unitOptions) {
-  console.log("[Server] callServerSolve:", inputCount, "answers, unit options:", unitOptions.length);
   const response = await fetch('http://127.0.0.1:5000/solve', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -186,7 +133,6 @@ async function callServerSolve(text, inputCount, unitOptions) {
 }
 
 async function callServerRetry(text, previousAnswers, feedbackText, attempt, inputCount, unitOptions) {
-  console.log("[Server] callServerRetry: attempt", attempt);
   const response = await fetch('http://127.0.0.1:5000/retry', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -196,57 +142,10 @@ async function callServerRetry(text, previousAnswers, feedbackText, attempt, inp
   return await response.json();
 }
 
-async function callGeminiWeb(problemText, inputCount, retryContext, wileyTabId, unitOptions) {
-  console.log("[Gemini] callGeminiWeb via server /gemini-web");
-  let prompt;
-  const unitHint = unitOptions && unitOptions.length > 0 ? `\nUnit options: ${JSON.stringify(unitOptions)}` : '';
-  if (retryContext) {
-    prompt = `The answers you gave for this problem were checked and some were marked incorrect. Fix only the wrong ones.\n\nPROBLEM:\n${problemText}\n\nPREVIOUS ANSWERS:\n${JSON.stringify(retryContext.previousAnswers)}\n\nFEEDBACK:\n${retryContext.feedbackText}\n\nThe answers marked "correct": true were accepted. DO NOT change them.\nOnly fix the answers marked "correct": false.\n\nReturn EXACTLY ${inputCount} answers. Return ONLY this JSON:\n{"answers":[{"value":"number","unit":"unit"},...],"reasoning":"..."}${unitHint}`;
-  } else {
-    prompt = `Solve this physics problem. Return EXACTLY ${inputCount} answers.\n\nRules:\n- "value" must be ONLY a number. No ranges, no units in value.\n- "unit" must match one of the provided options exactly.${unitHint}\n\nReturn ONLY this JSON (no other text):\n{"answers":[{"value":"number","unit":"unit"},...],"reasoning":"..."}\n\nPROBLEM:\n${problemText}`;
-  }
-  try {
-    const response = await fetch('http://127.0.0.1:5000/gemini-web', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ prompt })
-    });
-    if (!response.ok) return null;
-    return await response.json();
-  } catch (e) {
-    console.log("[Gemini] Server fetch failed:", e.message);
-    return null;
-  }
-}
-
-async function callGroqDirect(text, inputCount, retryContext, unitOptions) {
-  let key = await new Promise(res => chrome.storage.local.get('groqKey', d => res(d.groqKey || '')));
-  if (!key) return null;
-  console.log("[Groq] Calling API directly...");
-  const unitHint = unitOptions && unitOptions.length > 0 ? ` Unit options: ${JSON.stringify(unitOptions)}` : '';
-  const systemMsg = retryContext
-    ? `Fix wrong answers. Previous: ${JSON.stringify(retryContext.previousAnswers)}. Feedback: ${retryContext.feedbackText}. Return EXACTLY ${inputCount} answers.${unitHint} JSON: {"answers":[{"value":"number","unit":"unit"},...]}`
-    : `Solve physics. Return EXACTLY ${inputCount} answers. "value"=number only, "unit"=one of the provided options.${unitHint} JSON: {"answers":[{"value":"number","unit":"unit"},...],"reasoning":"..."}`;
-  const resp = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + key },
-    body: JSON.stringify({ model: 'llama-3.3-70b-versatile', messages: [{ role: 'system', content: systemMsg }, { role: 'user', content: text }], temperature: 0.1, max_tokens: 2000 })
-  });
-  if (!resp.ok) return null;
-  const data = await resp.json();
-  return extractJSON(data.choices?.[0]?.message?.content);
-}
-
-async function checkServerAlive() {
-  try { const r = await fetch('http://127.0.0.1:5000/', { signal: AbortSignal.timeout(2000) }); return r.ok; } catch { return false; }
-}
-
-// --- Answer cleaning ---
-
+// --- Helper Functions ---
 function cleanAnswersExtension(answers) {
   return answers.map(a => {
     let val = String(a.value || '').trim();
-    const unit = a.unit;
     if (val.startsWith('+')) val = val.slice(1);
     if (/to|–|-/.test(val)) {
       const parts = val.match(/[\d.]+/g);
@@ -255,7 +154,7 @@ function cleanAnswersExtension(answers) {
     const firstNum = val.match(/[\d.]+/);
     if (firstNum) val = firstNum[0];
     if (isNaN(parseFloat(val))) val = '';
-    return { value: val, unit, correct: a.correct };
+    return { value: val, unit: a.unit, correct: a.correct };
   });
 }
 
@@ -267,44 +166,43 @@ function validateAnswers(answers) {
   });
 }
 
-// --- Submit & Next ---
+async function getWileyTab() {
+  const patterns = ['*://*.wiley.com/*', '*://*.wileyplus.com/*', '*://*.wileyplus.knowmia.com/*'];
+  for (const p of patterns) {
+    const tabs = await chrome.tabs.query({ url: p });
+    if (tabs.length > 0) return tabs[0];
+  }
+  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  return tab;
+}
 
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+// --- Background Diagnostics Generator ---
+async function autoDebugPage(tab) {
+  const r = await chrome.scripting.executeScript({
+    target: { tabId: tab.id, allFrames: true },
+    func: () => {
+      const inputs = Array.from(document.querySelectorAll('input[type="text"], input[type="number"]')).map((inp, i) => ({
+        index: i, ariaLabel: inp.getAttribute('aria-label'), value: inp.value, classes: inp.className, id: inp.id
+      }));
+      const submitBtns = Array.from(document.querySelectorAll('button, input[type="submit"]')).map((btn, i) => ({
+        index: i, text: btn.innerText?.trim(), classes: btn.className, visible: btn.offsetParent !== null
+      }));
+      return { inputs, submitBtns };
+    }
+  });
+  if (r[0]?.result) {
+    chrome.storage.local.set({ lastAutoDebug: { timestamp: new Date().toLocaleTimeString(), data: r[0].result } });
+  }
+}
+
+// --- Submit & Next Logic ---
 async function clickSubmit(tab) {
   const r = await chrome.scripting.executeScript({
     target: { tabId: tab.id, allFrames: true },
     func: () => {
-      const selectors = [
-        'button.btn.btn-primary.was-submit-answer.m-l-h',
-        'button.was-submit-answer',
-        'button[data-testid="submit-answer"]',
-        'button[aria-label*="Submit"]',
-        '.submit-button',
-        'button.MuiButton-root[type="submit"]'
-      ];
-      for (const sel of selectors) {
-        try {
-          const btn = document.querySelector(sel);
-          if (btn && btn.offsetParent !== null) { btn.click(); return { success: true, selector: sel }; }
-        } catch {}
-      }
-      return { success: false };
-    }
-  });
-  return r.some(rr => rr.result?.success === true);
-}
-
-async function clickSubmitFallback(tab) {
-  const r = await chrome.scripting.executeScript({
-    target: { tabId: tab.id, allFrames: true },
-    func: () => {
-      const selectors = [
-        'button.was-submit-answer:not(.btn-primary)',
-        'button.btn-primary:not(.was-submit-answer)',
-        'button[type="submit"]',
-        'input[type="submit"]',
-        '[role="button"][aria-label*="Submit"]',
-        '.submit-button'
-      ];
+      const selectors = ['button.was-submit-answer', 'button[data-testid="submit-answer"]', 'button[aria-label*="Submit"]', '.submit-button', 'button:has-text("Submit")'];
       for (const sel of selectors) {
         try {
           const btn = document.querySelector(sel);
@@ -317,172 +215,53 @@ async function clickSubmitFallback(tab) {
   return r.some(rr => rr.result === true);
 }
 
-async function clickNext(tab) {
-  const r = await chrome.scripting.executeScript({
-    target: { tabId: tab.id, allFrames: true },
-    func: () => {
-      const selectors = [
-        'button[data-testid="next-button"]',
-        'button[title="Next question"]',
-        'button[aria-label="Next question"]',
-        'button[aria-label="Next"]',
-        'button.MuiIconButton-root[title="Next question"]',
-        'button.MuiButtonBase-root[title="Next question"]',
-        '.MuiIconButton-root[title="Next question"]',
-        'button[title*="Next"]'
-      ];
-      for (const sel of selectors) {
-        try {
-          let btn = document.querySelector(sel);
-          if (btn && btn.offsetParent !== null) { btn.click(); return { success: true }; }
-        } catch {}
-      }
-      return { success: false };
-    }
-  });
-  return r.some(rr => rr.result?.success === true);
-}
-
-// --- Auto debug ---
-
-async function autoDebugPage(tab) {
-  console.log("[AutoDebug] Running backend page inspection...");
-  const r = await chrome.scripting.executeScript({
-    target: { tabId: tab.id, allFrames: true },
-    func: () => {
-      const inputs = Array.from(document.querySelectorAll('input[type="text"], input[type="number"]')).map((inp, i) => ({
-        index: i, type: inp.type, ariaLabel: inp.getAttribute('aria-label'), value: inp.value, classes: inp.className, id: inp.id
-      }));
-      const submitBtns = Array.from(document.querySelectorAll('button, input[type="submit"]')).map((btn, i) => ({
-        index: i, tag: btn.tagName, text: btn.innerText?.trim(), classes: btn.className, visible: btn.offsetParent !== null
-      }));
-      return { inputs, submitBtns };
-    }
-  });
-  if (r[0]?.result) {
-    safeStorageSet({ lastAutoDebug: { timestamp: new Date().toLocaleTimeString(), data: r[0].result } });
-    console.log("[AutoDebug] DIAGNOSTICS SAVED");
-  }
-}
-
-// --- Get tabs ---
-
-async function getWileyTab() {
-  const patterns = ['*://*.wiley.com/*', '*://*.wileyplus.com/*', '*://*.wileyplus.knowmia.com/*'];
-  for (const p of patterns) {
-    const tabs = await chrome.tabs.query({ url: p });
-    if (tabs.length > 0) return tabs[0];
-  }
-  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-  if (tab && tab.url && !tab.url.includes('gemini.google.com')) return tab;
-  return tab;
-}
-
-async function handleSuccess(answers, status, resultDiv, wileyTab) {
-  const text = answers.map(a => `${a.value} ${a.unit}`).join('\n');
+async function handleSuccess(answers, status, resultDiv) {
   status.innerText = "All correct!";
-  resultDiv.innerText = text;
+  resultDiv.innerText = answers.map(a => `${a.value} ${a.unit}`).join('\n');
   resultDiv.style.display = "block";
-  safeStorageSet({ lastResult: { text, timestamp: new Date().toLocaleTimeString() } });
-  if (autoNextEnabled) {
-    status.innerText = "All correct! Moving to next...";
-    await sleep(1500);
-    const nextResult = await clickNext(wileyTab);
-    if (nextResult.some(r => r.result?.success)) {
-      status.innerText = "Moved to next question.";
-    } else {
-      resultDiv.innerText = text + "\n\n[Auto-next: next button not found]";
-    }
-  }
 }
 
-// --- MAIN SOLVE ---
-
+// --- MAIN SOLVE FLOW ---
 async function solve() {
   const status = document.getElementById('status');
   const btn = document.getElementById('solveBtn');
   const resultDiv = document.getElementById('result');
+
   btn.disabled = true;
   resultDiv.style.display = "none";
 
   try {
     const tab = await getWileyTab();
-    if (!tab) throw new Error("No WileyPLUS tab open. Open a problem first.");
+    if (!tab) throw new Error("No WileyPLUS tab open.");
 
-    setStep(1, 'active');
     status.innerText = "Scraping...";
     const state = await scrapeFullState(tab);
-    if (!state.text || state.text.trim().length === 0) throw new Error("Could not find any text on the page.");
+
     if (state.inputCount === 0) {
       await autoDebugPage(tab);
-      throw new Error("Found 0 input fields. Debug data saved.");
-    }
-    console.log("[Solve] Scraped:", state.inputCount, "inputs, unit options:", state.unitOptions);
-
-    setStep(2, 'active');
-    status.innerText = "Asking Gemini (web)...";
-    let data = await callGeminiWeb(state.text, state.inputCount, undefined, tab.id, state.unitOptions);
-    let usedGemini = !!data;
-
-    if (!data || !data.answers) {
-      console.log("[Solve] Gemini unavailable, trying Groq direct...");
-      setStep(2, 'active');
-      status.innerText = "Gemini unavailable, using Groq...";
-      data = await callGroqDirect(state.text, state.inputCount, null, state.unitOptions);
-      usedGemini = false;
+      throw new Error("Could not find any text inputs. Debug data saved to background.");
     }
 
-    if (!data || !data.answers) {
-      const serverAlive = await checkServerAlive();
-      if (serverAlive) {
-        setStep(2, 'active');
-        status.innerText = "Groq unavailable, using server...";
-        data = await callServerSolve(state.text, state.inputCount, state.unitOptions);
-      } else {
-        throw new Error("No AI available. Start the server or set a Groq key.");
-      }
-    }
+    status.innerText = "Asking Backend Server...";
+    let data = await callServerSolve(state.text, state.inputCount, state.unitOptions);
 
-    if (!data || !data.answers) throw new Error("AI returned no answers.");
+    if (!data || !data.answers) throw new Error("Server returned no answers");
 
-    setStep(3, 'active');
     data.answers = cleanAnswersExtension(data.answers);
     validateAnswers(data.answers);
 
-    setStep(4, 'active');
     status.innerText = "Filling answers...";
     await fillAnswers(tab, data.answers);
 
-    // Pre-submit fill retry
-    let filled = false;
-    for (let fillAttempt = 0; fillAttempt < 3; fillAttempt++) {
-      if (fillAttempt > 0) {
-        console.log("[Solve] Re-filling attempt", fillAttempt + 1);
-        await fillAnswers(tab, data.answers);
-      }
-      await sleep(1500);
-      filled = await checkInputsFilled(tab);
-      if (filled) break;
-    }
-
-    setStep(5, 'active');
     status.innerText = "Submitting...";
     const submitResult = await clickSubmit(tab);
-    if (!submitResult) {
-      const fbResult = await clickSubmitFallback(tab);
-      if (!fbResult) {
-        console.warn("[Solve] All submit buttons failed, triggering auto-debug...");
-        await autoDebugPage(tab);
-      }
-    }
-
+    if (!submitResult) await autoDebugPage(tab);
     await sleep(7000);
 
-    // Post-submit verification
+    // ---------------------------------------------
+    // POST-SUBMIT VERIFICATION & RETRY LOGIC
+    // ---------------------------------------------
     let postState = await scrapeFullState(tab);
-    while (data.answers.length < postState.inputStates.length) {
-      data.answers.push({ value: '', unit: 'No units' });
-    }
     let currentAnswers = postState.inputStates.map((s, i) => ({
       ...data.answers[i],
       correct: !s.invalid && s.value !== ''
@@ -490,59 +269,39 @@ async function solve() {
 
     let hadErrors = currentAnswers.some(a => a.correct === false);
 
-    // Safety net: check for global "partially correct" / "incorrect" text
     const lowerText = postState.text.toLowerCase();
     const hasGlobalError = lowerText.includes("partially correct") || lowerText.includes("incorrect");
+
     if (!hadErrors && hasGlobalError) {
-      console.warn("[Solve] No inputs flagged invalid, but global error found. Forcing retry.");
-      currentAnswers.forEach(a => a.correct = false);
-      hadErrors = true;
+        console.warn("[Solve] No inputs flagged as invalid, but global error found. Forcing retry.");
+        currentAnswers.forEach(a => a.correct = false);
+        hadErrors = true;
     }
 
     if (!hadErrors) {
-      setStep(6, 'done');
-      await handleSuccess(currentAnswers, status, resultDiv, tab);
+      await handleSuccess(currentAnswers, status, resultDiv);
       return;
     }
 
-    // Retry loop
+    // RETRY LOOP
     for (let attempt = 1; attempt <= 3; attempt++) {
       status.innerText = `Retry ${attempt}: fixing wrong answers...`;
-      let retryData;
-      if (usedGemini) {
-        retryData = await callGeminiWeb(state.text, state.inputCount, { previousAnswers: currentAnswers, feedbackText: postState.text }, tab.id, state.unitOptions);
-      }
-      if (!retryData || !retryData.answers) {
-        const serverAlive = await checkServerAlive();
-        if (serverAlive) {
-          retryData = await callServerRetry(state.text, currentAnswers, postState.text, attempt, state.inputCount, state.unitOptions);
-        }
-      }
+
+      let retryData = await callServerRetry(state.text, currentAnswers, postState.text, attempt, state.inputCount, state.unitOptions);
       if (!retryData || !retryData.answers) break;
 
       retryData.answers = cleanAnswersExtension(retryData.answers);
       if (retryData.action === 'done' || currentAnswers.every(a => a.correct === true)) {
-        await handleSuccess(currentAnswers, status, resultDiv, tab);
+        await handleSuccess(currentAnswers, status, resultDiv);
         return;
       }
       validateAnswers(retryData.answers);
 
-      while (retryData.answers.length < currentAnswers.length) {
-        retryData.answers.push({ value: '', unit: 'No units' });
-      }
-      currentAnswers = currentAnswers.map((old, i) => {
-        if (old.correct === true) return old;
-        return { ...retryData.answers[i], correct: false };
-      });
+      // Merge fixes
+      currentAnswers = currentAnswers.map((old, i) => old.correct === true ? old : { ...retryData.answers[i], correct: false });
 
       await fillAnswers(tab, currentAnswers);
-      await sleep(1500);
-
-      let retrySubmitResult = await clickSubmit(tab);
-      if (!retrySubmitResult) {
-        retrySubmitResult = await clickSubmitFallback(tab);
-        if (!retrySubmitResult) await autoDebugPage(tab);
-      }
+      await clickSubmit(tab);
       await sleep(7000);
 
       postState = await scrapeFullState(tab);
@@ -551,16 +310,23 @@ async function solve() {
         correct: !s.invalid && s.value !== ''
       }));
 
-      const stillWrong = currentAnswers.some(a => a.correct === false);
-      const globalErrorCheck = postState.text.toLowerCase().includes("partially correct") || postState.text.toLowerCase().includes("incorrect");
-      if (!stillWrong && !globalErrorCheck) {
-        setStep(6, 'done');
-        await handleSuccess(currentAnswers, status, resultDiv, tab);
+      let stillWrong = currentAnswers.some(a => a.correct === false);
+      const lowerTextRetry = postState.text.toLowerCase();
+      const globalErrorCheck = lowerTextRetry.includes("partially correct") || lowerTextRetry.includes("incorrect");
+
+      // SAFETY NET COPIED INTO RETRY LOOP
+      if (!stillWrong && globalErrorCheck) {
+          console.warn("[Solve] Retry Loop: Global error detected but no individual invalid inputs. Forcing retry.");
+          currentAnswers.forEach(a => a.correct = false);
+          stillWrong = true;
+      }
+
+      if (!stillWrong) {
+        await handleSuccess(currentAnswers, status, resultDiv);
         return;
       }
     }
 
-    setStep(6, 'error');
     status.innerText = "Some still wrong.";
     resultDiv.innerText = "Final status:\n" + currentAnswers.map(a => `${a.value} ${a.unit} [${a.correct ? 'OK' : 'WRONG'}]`).join('\n') + "\n\nCheck manually.";
     resultDiv.style.display = "block";
@@ -569,37 +335,11 @@ async function solve() {
     status.innerText = "Error";
     resultDiv.innerText = e.message;
     resultDiv.style.display = "block";
-    console.error(e);
   } finally {
     btn.disabled = false;
-    setTimeout(clearUI, 3000);
   }
 }
 
-// --- Init ---
-
 document.addEventListener('DOMContentLoaded', () => {
   document.getElementById('solveBtn').addEventListener('click', solve);
-
-  const autoNextToggle = document.getElementById('autoNextToggle');
-  if (autoNextToggle) {
-    chrome.storage.local.get('autoNextEnabled', d => {
-      autoNextEnabled = !!d.autoNextEnabled;
-      autoNextToggle.checked = autoNextEnabled;
-    });
-    autoNextToggle.addEventListener('change', () => {
-      autoNextEnabled = autoNextToggle.checked;
-      safeStorageSet({ autoNextEnabled });
-    });
-  }
-
-  async function checkServer() {
-    const dot = document.getElementById('serverDot');
-    const label = document.getElementById('serverLabel');
-    const alive = await checkServerAlive();
-    if (dot) dot.className = alive ? 'dot green' : 'dot red';
-    if (label) label.textContent = alive ? 'Server: connected' : 'Server: offline';
-  }
-  checkServer();
-  setInterval(checkServer, 10000);
 });
