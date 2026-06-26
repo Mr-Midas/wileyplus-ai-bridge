@@ -18,6 +18,48 @@ function clearUI() {
   }
 }
 
+// --- Deep DOM Diagnostics Scraper ---
+async function getAdvancedDiagnostics(tab) {
+  const r = await chrome.scripting.executeScript({
+    target: { tabId: tab.id, allFrames: true },
+    func: () => {
+      const headSummary = {
+        scripts: Array.from(document.querySelectorAll('script[src]'))
+          .map(s => s.src.split('/').pop())
+          .filter(s => s.includes('was') || s.includes('ui') || s.includes('react') || s.includes('bundle')),
+        styles: Array.from(document.querySelectorAll('link[rel="stylesheet"]'))
+          .map(l => l.href.split('/').pop())
+          .filter(h => h.includes('was') || h.includes('ui') || h.includes('main')),
+        meta: Array.from(document.querySelectorAll('meta[name]')).map(m => m.name).slice(0, 5)
+      };
+
+      const inputs = Array.from(document.querySelectorAll('input, select, textarea')).map(inp => {
+        const parent = inp.parentElement;
+        return {
+          tag: inp.tagName,
+          type: inp.type,
+          classes: inp.className,
+          hidden: inp.hidden || inp.style.display === 'none' || inp.style.visibility === 'hidden' || inp.type === 'hidden',
+          disabled: inp.disabled,
+          readOnly: inp.readOnly,
+          value: inp.value,
+          parentClasses: parent ? parent.className : ''
+        };
+      });
+
+      const buttons = Array.from(document.querySelectorAll('button, input[type="submit"], [role="button"]')).map(btn => ({
+        text: btn.innerText?.trim()?.substring(0, 30) || btn.value,
+        classes: btn.className,
+        disabled: btn.disabled,
+        visible: btn.offsetParent !== null
+      }));
+
+      return { headSummary, inputs, buttons };
+    }
+  });
+  return r[0]?.result || null;
+}
+
 // --- Scraper & Fill Logic ---
 async function scrapeFullState(tab) {
   const results = await chrome.scripting.executeScript({
@@ -142,11 +184,11 @@ async function callServerSolve(text, inputCount, unitOptions) {
   return await response.json();
 }
 
-async function callServerRetry(text, previousAnswers, feedbackText, attempt, inputCount, unitOptions) {
+async function callServerRetry(text, previousAnswers, feedbackText, attempt, inputCount, unitOptions, diagnostics = null) {
   const response = await fetch('http://127.0.0.1:5000/retry', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ original_text: text, previous_answers: previousAnswers, feedback_text: feedbackText, attempt, input_count: inputCount, unit_options: unitOptions })
+    body: JSON.stringify({ original_text: text, previous_answers: previousAnswers, feedback_text: feedbackText, attempt, input_count: inputCount, unit_options: unitOptions, diagnostics })
   });
   if (!response.ok) throw new Error(`Retry error ${response.status}`);
   return await response.json();
@@ -325,11 +367,25 @@ async function solve() {
     }
 
     // RETRY LOOP
+    let lastDiagnosticAlert = null;
     for (let attempt = 1; attempt <= 3; attempt++) {
       status.innerText = `Retry ${attempt}: fixing wrong answers...`;
 
-      let retryData = await callServerRetry(state.text, currentAnswers, postState.text, attempt, state.inputCount, state.unitOptions);
+      // Run deep diagnostics on attempt 3
+      let diagnostics = null;
+      if (attempt === 3) {
+        status.innerText = "Attempt 3: Running Deep DOM Diagnostics...";
+        diagnostics = await getAdvancedDiagnostics(tab);
+      }
+
+      let retryData = await callServerRetry(state.text, currentAnswers, postState.text, attempt, state.inputCount, state.unitOptions, diagnostics);
       if (!retryData || !retryData.answers) break;
+
+      // Save AI diagnostic alert if it generated one
+      if (retryData.diagnostics_alert) {
+        lastDiagnosticAlert = retryData.diagnostics_alert;
+        console.warn("[AI DOM ANALYSIS]", lastDiagnosticAlert);
+      }
 
       retryData.answers = cleanAnswersExtension(retryData.answers);
       if (retryData.action === 'done' || currentAnswers.every(a => a.correct === true)) {
@@ -393,7 +449,14 @@ async function solve() {
     }
 
     status.innerText = "Some still wrong.";
-    resultDiv.innerText = "Final status:\n" + currentAnswers.map(a => `${a.value} ${a.unit} [${a.correct ? 'OK' : 'WRONG'}]`).join('\n') + "\n\nCheck manually.";
+    let finalOutput = "Final status:\n" + currentAnswers.map(a => `${a.value} ${a.unit} [${a.correct ? 'OK' : 'WRONG'}]`).join('\n') + "\n\nCheck manually.";
+
+    // Display the AI's DOM analysis directly in the extension UI
+    if (lastDiagnosticAlert) {
+      finalOutput = "AI SYSTEM ANALYSIS:\n" + lastDiagnosticAlert + "\n\n" + finalOutput;
+    }
+
+    resultDiv.innerText = finalOutput;
     resultDiv.style.display = "block";
 
   } catch (e) {

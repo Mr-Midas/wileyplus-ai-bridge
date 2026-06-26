@@ -168,6 +168,7 @@ def retry():
     feedback_text = data.get('feedback_text', '')
     input_count = data.get('input_count', 0)
     unit_options = data.get('unit_options', [])
+    diagnostics = data.get('diagnostics', None)
 
     if not original_text or not previous_answers:
         return jsonify({"error": "Missing data"}), 400
@@ -201,6 +202,24 @@ Rules:
 {unit_hint}
 - Return ALL {input_count} answers (correct ones unchanged + fixed ones in their original order).
 """
+
+    # 3rd Retry Diagnostics Injection
+    if diagnostics:
+        prompt += f"""
+====================================================
+CRITICAL DOM DIAGNOSTICS (ATTEMPT 3 FAILING)
+====================================================
+The extension is failing to submit or fill correctly. Analyze the structural layout of the live page's scripts, inputs, and buttons to determine why:
+{json.dumps(diagnostics)}
+
+Look for:
+1. Are there hidden inputs we are accidentally trying to fill? (Adapt your answers array to skip them).
+2. Is the submit button disabled because a specific format is required?
+3. Are we misinterpreting the framework (MUI, Ant Design)?
+
+Return an EXTRA field in your JSON called "diagnostics_alert" containing a short technical explanation of what is breaking the submission.
+"""
+
     result = solve_with_priority(prompt, retry_context=True)
     if result:
         if result.get('answers'):
