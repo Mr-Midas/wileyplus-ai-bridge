@@ -79,9 +79,31 @@ async function scrapeFullState(tab) {
         attemptsTotal = parseInt(attemptMatch[2], 10);
       }
 
-      // 2. GROUPED DOM EXTRACTION: [Sign Dropdown] -> [Number Box] -> [Unit Dropdown]
-      const elements = Array.from(document.querySelectorAll('input[type="text"]:not([readonly]):not([hidden]), input[type="number"]:not([readonly]):not([hidden]), select'))
-        .filter(el => !el.id?.toLowerCase().includes('search') && !el.className.toLowerCase().includes('search'));
+      // 2. ISOLATE ACTIVE QUESTION CONTAINER
+      const allInputsForSearch = Array.from(document.querySelectorAll('input[type="text"]:not([readonly]), input[type="number"]:not([readonly])'))
+        .filter(el => !el.hidden && el.offsetParent !== null && !el.id?.toLowerCase().includes('search') && !el.className.toLowerCase().includes('search'));
+
+      let container = document.body;
+      const firstEmpty = allInputsForSearch.find(inp => inp.value.trim() === '');
+      const targetInput = firstEmpty || allInputsForSearch[0];
+
+      if (targetInput) {
+        let el = targetInput.closest('.question-content, .problem-statement, section.question, .assessment-question, [class*="question"], [class*="problem"], .assessment-item');
+        if (!el) el = targetInput.parentElement;
+        if (el && el !== document.body && el !== document.documentElement) {
+          container = el;
+        }
+      }
+
+      // 3. GROUPED DOM EXTRACTION strictly inside sandbox container
+      const rawElements = Array.from(container.querySelectorAll('input[type="text"]:not([readonly]), input[type="number"]:not([readonly]), select'));
+      
+      const elements = rawElements.filter(el => {
+          if (el.tagName === 'INPUT') {
+              return !el.hidden && el.offsetParent !== null && !el.id?.toLowerCase().includes('search') && !el.className.toLowerCase().includes('search');
+          }
+          return true;
+      });
       
       let fields = [];
       let tempGroup = { signSelect: null, input: null, unitSelect: null };
@@ -91,10 +113,15 @@ async function scrapeFullState(tab) {
         
         if (el.tagName === 'SELECT') {
             const options = Array.from(el.options).map(o => o.textContent.trim());
-            const isSignDropdown = options.includes('+') || options.includes('-') || options.includes('positive');
+            const isSignDropdown = options.includes('+') || options.includes('-') || options.some(o => /positive|negative/i.test(o));
             
-            if (isSignDropdown && !tempGroup.input) {
-                tempGroup.signSelect = el;
+            if (isSignDropdown) {
+                if (!tempGroup.input) {
+                    tempGroup.signSelect = el;
+                } else {
+                    fields.push(tempGroup);
+                    tempGroup = { signSelect: el, input: null, unitSelect: null };
+                }
             } else if (tempGroup.input && !tempGroup.unitSelect) {
                 tempGroup.unitSelect = el;
                 fields.push(tempGroup);
@@ -120,8 +147,9 @@ async function scrapeFullState(tab) {
         }
       }
       if (tempGroup.input) fields.push(tempGroup);
+      fields = fields.filter(g => g.input !== null);
 
-      // 3. SMART DOM INSPECTION (Map groups to metadata)
+      // 4. SMART DOM INSPECTION (Map groups to metadata)
       const fieldData = fields.map(g => {
         const inp = g.input;
         const parent = inp.closest('label, div, td, tr, .question-content');
@@ -148,27 +176,13 @@ async function scrapeFullState(tab) {
         };
       });
       
-      // 4. TEXT EXTRACTION
-      let text = '';
-      const firstEmpty = fields.find(g => g.input.value.trim() === '');
-      if (firstEmpty) {
-        let el = firstEmpty.input.closest('.question-content, .problem-statement, section.question, .assessment-question, [class*="question"], [class*="problem"]');
-        if (!el) el = firstEmpty.input.parentElement;
-        if (el && el !== document.body) {
-          const clone = el.cloneNode(true);
-          clone.querySelectorAll('script, style, nav, header, footer, .navigation, .sidebar').forEach(e => e.remove());
-          text = clone.innerText;
-        }
-      }
-      
-      if (!text) {
-        const cloned = document.body.cloneNode(true);
-        cloned.querySelectorAll('script, style, nav, header, footer, .navigation, .sidebar').forEach(e => e.remove());
-        text = cloned.innerText;
-      }
+      // 5. TEXT EXTRACTION from sandbox only
+      const clone = container.cloneNode(true);
+      clone.querySelectorAll('script, style, nav, header, footer, .navigation, .sidebar').forEach(e => e.remove());
+      const extractedText = clone.innerText;
       
       return JSON.stringify({ 
-          text, 
+          text: extractedText, 
           fields: fieldData, 
           attemptsUsed,
           attemptsTotal
@@ -215,8 +229,27 @@ async function fillAnswers(tab, answers) {
           element.dispatchEvent(new Event('blur', { bubbles: true }));
       }
 
-      const elements = Array.from(document.querySelectorAll('input[type="text"]:not([readonly]):not([hidden]), input[type="number"]:not([readonly]):not([hidden]), select'))
-        .filter(el => !el.id?.toLowerCase().includes('search') && !el.className.toLowerCase().includes('search'));
+      // Isolate sandbox EXACTLY like scrapeFullState for 1:1 mapping
+      const allInputsForSearch = Array.from(document.querySelectorAll('input[type="text"]:not([readonly]), input[type="number"]:not([readonly])'))
+        .filter(el => !el.hidden && el.offsetParent !== null && !el.id?.toLowerCase().includes('search') && !el.className.toLowerCase().includes('search'));
+
+      let container = document.body;
+      const firstEmpty = allInputsForSearch.find(inp => inp.value.trim() === '');
+      const targetInput = firstEmpty || allInputsForSearch[0];
+
+      if (targetInput) {
+        let el = targetInput.closest('.question-content, .problem-statement, section.question, .assessment-question, [class*="question"], [class*="problem"], .assessment-item');
+        if (!el) el = targetInput.parentElement;
+        if (el && el !== document.body && el !== document.documentElement) {
+          container = el; 
+        }
+      }
+
+      const rawElements = Array.from(container.querySelectorAll('input[type="text"]:not([readonly]), input[type="number"]:not([readonly]), select'));
+      const elements = rawElements.filter(el => {
+          if (el.tagName === 'INPUT') return !el.hidden && el.offsetParent !== null && !el.id?.toLowerCase().includes('search') && !el.className.toLowerCase().includes('search');
+          return true; 
+      });
       
       let fields = [];
       let tempGroup = { signSelect: null, input: null, unitSelect: null };
@@ -225,8 +258,13 @@ async function fillAnswers(tab, answers) {
         const el = elements[i];
         if (el.tagName === 'SELECT') {
             const options = Array.from(el.options).map(o => o.textContent.trim());
-            if (options.includes('+') || options.includes('-')) {
+            const isSignDropdown = options.includes('+') || options.includes('-') || options.some(o => /positive|negative/i.test(o));
+            if (isSignDropdown) {
                 if (!tempGroup.input) tempGroup.signSelect = el;
+                else {
+                    fields.push(tempGroup);
+                    tempGroup = { signSelect: el, input: null, unitSelect: null };
+                }
             } else if (tempGroup.input && !tempGroup.unitSelect) {
                 tempGroup.unitSelect = el;
                 fields.push(tempGroup);
@@ -251,6 +289,7 @@ async function fillAnswers(tab, answers) {
         }
       }
       if (tempGroup.input) fields.push(tempGroup);
+      fields = fields.filter(g => g.input !== null);
 
       ans.forEach((a, i) => {
         const field = fields[i];
@@ -335,7 +374,7 @@ async function clickSubmit(tab) {
   const r = await chrome.scripting.executeScript({
     target: { tabId: tab.id, allFrames: true },
     func: () => {
-      const selectors = ['button.was-submit-answer', 'button[data-testid="submit-answer"]', 'button[aria-label*="Submit"]', '.submit-button'];
+      const selectors = ['button.was-submit-answer', 'button[data-testid="submit-answer"]', 'button[aria-label*="Submit"]', '.submit-button', 'button:has-text("Submit")'];
       for (const sel of selectors) {
         try {
           const btn = document.querySelector(sel);
