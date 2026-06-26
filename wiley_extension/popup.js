@@ -438,6 +438,30 @@ async function clickNext(tab) {
   return r;
 }
 
+async function autoDebugPage(tab) {
+  console.log("[AutoDebug] Running backend page inspection...");
+  const r = await chrome.scripting.executeScript({
+    target: { tabId: tab.id, allFrames: true },
+    func: () => {
+      const inputs = Array.from(document.querySelectorAll('input[aria-label="Enter your answer"], textarea[aria-label="Enter your answer"]')).map((inp, i) => ({
+        index: i, tag: inp.tagName, type: inp.type, ariaLabel: inp.getAttribute('aria-label'),
+        value: inp.value, classes: inp.className, id: inp.id,
+        selector: inp.tagName.toLowerCase() + '[aria-label="Enter your answer"]'
+      }));
+      const submitBtns = Array.from(document.querySelectorAll('button, input[type="submit"]')).map((btn, i) => ({
+        index: i, tag: btn.tagName, text: btn.innerText?.trim(), classes: btn.className, id: btn.id,
+        ariaLabel: btn.getAttribute('aria-label'), visible: btn.offsetParent !== null
+      }));
+      return { inputs, submitBtns };
+    }
+  });
+  const data = r[0]?.result;
+  if (data) {
+    console.log("[AutoDebug] DIAGNOSTICS GENERATED:", data);
+    safeStorageSet({ lastAutoDebug: { timestamp: new Date().toLocaleTimeString(), data } });
+  }
+}
+
 async function handleSuccess(answers, status, resultDiv, wileyTab) {
   console.log("[Wiley] handleSuccess:", answers.length, "answers, all correct");
   const text = answers.map(a => `${a.value} ${a.unit}`).join('\n');
@@ -570,6 +594,11 @@ async function solve() {
         // Try fallback submit selectors
         const fbResult = await clickSubmitFallback(tab);
         console.log("[Solve] Fallback submit result:", fbResult);
+        // Auto-debug on submit failure
+        if (!fbResult) {
+          console.warn("[Solve] All submit buttons failed, triggering auto-debug...");
+          await autoDebugPage(tab);
+        }
       }
       await sleep(7000);
     }
@@ -652,6 +681,10 @@ async function solve() {
       let retrySubmitResult = await clickSubmit(tab);
       if (!retrySubmitResult.some(r => r.result === true)) {
         retrySubmitResult = await clickSubmitFallback(tab);
+        if (!retrySubmitResult) {
+          console.warn("[Solve] Retry submit failed, triggering auto-debug...");
+          await autoDebugPage(tab);
+        }
       }
       await sleep(7000);
 
