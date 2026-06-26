@@ -20,7 +20,6 @@ function clearUI() {
 
 // --- Scraper & Fill Logic ---
 async function scrapeFullState(tab) {
-  console.log("[Scrape] scrapeFullState: tab =", tab.url);
   const results = await chrome.scripting.executeScript({
     target: { tabId: tab.id, allFrames: true },
     func: () => {
@@ -28,7 +27,7 @@ async function scrapeFullState(tab) {
       const inputs = Array.from(document.querySelectorAll('input[type="text"]:not([readonly]):not([hidden]), input[type="number"]:not([readonly]):not([hidden])'))
         .filter(inp => !inp.id.toLowerCase().includes('search') && !inp.className.toLowerCase().includes('search'));
 
-      // Get Dropdown Units (Removed :not([hidden]) to catch React/MUI hidden selects)
+      // Get Dropdown Units
       const selects = Array.from(document.querySelectorAll('select'));
       const selectOptions = selects.map(sel =>
         Array.from(sel.options)
@@ -36,18 +35,28 @@ async function scrapeFullState(tab) {
           .filter(t => t && t.toLowerCase() !== 'select an option' && t !== '---' && t !== '')
       );
 
-      // Aggressively check for Wrong/Invalid Indicators
+      // SMART DOM INSPECTION: Distinguish between Right, Wrong, and Neutral
       const states = inputs.map(inp => {
         const parent = inp.closest('label, div, td, tr, .question-content');
-        const invalidAttr = inp.getAttribute('aria-invalid') === 'true';
-
         const html = parent ? parent.innerHTML.toLowerCase() : inp.outerHTML.toLowerCase();
+
+        // Check for explicit "Wrong" indicators
+        const invalidAttr = inp.getAttribute('aria-invalid') === 'true';
         const hasWrongIcon = html.includes('fa-times') || html.includes('incorrect') || html.includes('wrong') || html.includes('error');
         const classInvalid = /invalid|incorrect|wrong|error/i.test(inp.className) || (parent && /invalid|incorrect|wrong|error/i.test(parent.className));
 
+        // Check for explicit "Correct" indicators
+        const hasCorrectIcon = html.includes('fa-check') || html.includes('correct') || html.includes('right');
+        const classCorrect = /correct|valid|success/i.test(inp.className) || (parent && /correct|valid|success/i.test(parent.className));
+
+        // Final logic (Ensures 'partially correct' doesn't accidentally flag a specific input as wrong)
+        const isActuallyWrong = (invalidAttr || classInvalid || hasWrongIcon) && !html.includes('partially correct');
+        const isActuallyRight = (hasCorrectIcon || classCorrect) && !isActuallyWrong;
+
         return {
           value: inp.value,
-          invalid: invalidAttr || classInvalid || hasWrongIcon
+          invalid: isActuallyWrong,
+          isCorrect: isActuallyRight
         };
       });
 
@@ -89,22 +98,23 @@ async function fillAnswers(tab, answers) {
     func: (ans) => {
       const numberInputs = Array.from(document.querySelectorAll('input[type="text"]:not([readonly]):not([hidden]), input[type="number"]:not([readonly]):not([hidden])'))
         .filter(inp => !inp.id.toLowerCase().includes('search') && !inp.className.toLowerCase().includes('search'));
-      const unitSelects = Array.from(document.querySelectorAll('select')); // Catch hidden selects
+      const unitSelects = Array.from(document.querySelectorAll('select'));
 
       ans.forEach((a, i) => {
-        // Fill Text/Number Value
-        if (numberInputs[i] && a.correct !== true) {
-          // React Native Value Setter bypass
+        // Only attempt fill if it's NOT explicitly marked correct AND we actually have a real value
+        let safeVal = String(a.value || '').trim();
+        if (safeVal.toLowerCase() === 'undefined' || safeVal.toLowerCase() === 'null') safeVal = '';
+
+        if (numberInputs[i] && a.correct !== true && safeVal !== '') {
           const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
-          if (nativeInputValueSetter) nativeInputValueSetter.call(numberInputs[i], a.value);
-          else numberInputs[i].value = a.value;
+          if (nativeInputValueSetter) nativeInputValueSetter.call(numberInputs[i], safeVal);
+          else numberInputs[i].value = safeVal;
 
           numberInputs[i].dispatchEvent(new Event('input', { bubbles: true }));
           numberInputs[i].dispatchEvent(new Event('change', { bubbles: true }));
         }
 
-        // Fill Dropdown Unit
-        if (unitSelects[i] && a.correct !== true) {
+        if (unitSelects[i] && a.correct !== true && a.unit) {
           const opt = Array.from(unitSelects[i].options).find(o => o.textContent.trim().toLowerCase() === String(a.unit).trim().toLowerCase());
           if (opt) {
             const nativeSelectValueSetter = Object.getOwnPropertyDescriptor(window.HTMLSelectElement.prototype, "value").set;
@@ -145,23 +155,32 @@ async function callServerRetry(text, previousAnswers, feedbackText, attempt, inp
 // --- Helper Functions ---
 function cleanAnswersExtension(answers) {
   return answers.map(a => {
+    if (!a) return { value: '', unit: 'No units', correct: false };
     let val = String(a.value || '').trim();
+
+    // Nuke AI hallucinations
+    if (val.toLowerCase() === 'undefined' || val.toLowerCase() === 'null') val = '';
+
     if (val.startsWith('+')) val = val.slice(1);
-    if (/to|–|-/.test(val)) {
+    if (/to|–|-/.test(val) && !val.startsWith('-')) {
       const parts = val.match(/[\d.]+/g);
       if (parts && parts.length >= 2) val = String((parseFloat(parts[0]) + parseFloat(parts[1])) / 2);
     }
-    const firstNum = val.match(/[\d.]+/);
+    const firstNum = val.match(/-?[\d.]+/);
     if (firstNum) val = firstNum[0];
     if (isNaN(parseFloat(val))) val = '';
-    return { value: val, unit: a.unit, correct: a.correct };
+
+    return { value: val, unit: a.unit || 'No units', correct: a.correct };
   });
 }
 
-function validateAnswers(answers) {
+function validateAnswers(answers, expectedCount) {
+  if (answers.length !== expectedCount) {
+      throw new Error(`Alignment Error: AI returned ${answers.length} answers, but page requires ${expectedCount}. Aborting to prevent bad fill.`);
+  }
   answers.forEach((a, i) => {
     const val = String(a.value).trim();
-    if (val === '' || isNaN(parseFloat(val))) throw new Error(`Answer ${i+1}: "${a.value}" is not a valid number`);
+    if (val === '' || isNaN(parseFloat(val))) throw new Error(`Answer ${i+1} is missing or not a valid number.`);
     a.value = val;
   });
 }
@@ -197,7 +216,13 @@ async function autoDebugPage(tab) {
   }
 }
 
-// --- Submit & Next Logic ---
+// --- Submit & Verify Logic ---
+async function verifyAllFilled(tab) {
+  const state = await scrapeFullState(tab);
+  const emptyCount = state.inputStates.filter(s => s.value.trim() === '').length;
+  return emptyCount === 0;
+}
+
 async function clickSubmit(tab) {
   const r = await chrome.scripting.executeScript({
     target: { tabId: tab.id, allFrames: true },
@@ -248,10 +273,15 @@ async function solve() {
     if (!data || !data.answers) throw new Error("Server returned no answers");
 
     data.answers = cleanAnswersExtension(data.answers);
-    validateAnswers(data.answers);
+    validateAnswers(data.answers, state.inputCount);
 
     status.innerText = "Filling answers...";
     await fillAnswers(tab, data.answers);
+
+    status.innerText = "Verifying inputs...";
+    if (!(await verifyAllFilled(tab))) {
+        throw new Error("Safety Abort: Some inputs are still blank. Submit aborted to save your attempt.");
+    }
 
     status.innerText = "Submitting...";
     const submitResult = await clickSubmit(tab);
@@ -262,22 +292,33 @@ async function solve() {
     // POST-SUBMIT VERIFICATION & RETRY LOGIC
     // ---------------------------------------------
     let postState = await scrapeFullState(tab);
-    let currentAnswers = postState.inputStates.map((s, i) => ({
-      ...data.answers[i],
-      correct: !s.invalid && s.value !== ''
-    }));
 
-    let hadErrors = currentAnswers.some(a => a.correct === false);
+    // Build state based strictly on physical DOM markers
+    let currentAnswers = postState.inputStates.map((s, i) => {
+        let correctStatus = false;
+        if (s.isCorrect) correctStatus = true; // Lock in explicit correct answers
+        else if (s.invalid) correctStatus = false; // Lock in explicit wrong answers
+        else correctStatus = (s.value !== ''); // Neutral but filled
 
+        return {
+            value: s.value,
+            unit: data.answers[i]?.unit || 'No units',
+            correct: correctStatus,
+            isNeutral: !s.isCorrect && !s.invalid
+        };
+    });
+
+    // Safety Net: Only invalidate neutral answers if "partially correct" is detected
     const lowerText = postState.text.toLowerCase();
     const hasGlobalError = lowerText.includes("partially correct") || lowerText.includes("incorrect");
 
-    if (!hadErrors && hasGlobalError) {
-        console.warn("[Solve] No inputs flagged as invalid, but global error found. Forcing retry.");
-        currentAnswers.forEach(a => a.correct = false);
-        hadErrors = true;
+    if (hasGlobalError) {
+        currentAnswers.forEach(a => {
+            if (a.isNeutral) a.correct = false; // Never touches a.correct if it had a green check!
+        });
     }
 
+    let hadErrors = currentAnswers.some(a => a.correct === false);
     if (!hadErrors) {
       await handleSuccess(currentAnswers, status, resultDiv);
       return;
@@ -295,30 +336,54 @@ async function solve() {
         await handleSuccess(currentAnswers, status, resultDiv);
         return;
       }
-      validateAnswers(retryData.answers);
 
-      // Merge fixes
-      currentAnswers = currentAnswers.map((old, i) => old.correct === true ? old : { ...retryData.answers[i], correct: false });
+      // Enforce length and validity
+      validateAnswers(retryData.answers, state.inputCount);
+
+      // Merge fixes carefully without ruining correct answers
+      currentAnswers = currentAnswers.map((old, i) => {
+          if (old.correct === true) return old; // Lock
+          const newAns = retryData.answers[i];
+          if (!newAns || newAns.value === '' || newAns.value === undefined) return old;
+          return { value: newAns.value, unit: newAns.unit, correct: false, isNeutral: old.isNeutral };
+      });
 
       await fillAnswers(tab, currentAnswers);
+
+      status.innerText = "Verifying retry inputs...";
+      if (!(await verifyAllFilled(tab))) {
+          throw new Error(`Safety Abort (Retry ${attempt}): AI left an input empty. Aborting submit.`);
+      }
+
       await clickSubmit(tab);
       await sleep(7000);
 
       postState = await scrapeFullState(tab);
-      currentAnswers = postState.inputStates.map((s, i) => ({
-        ...currentAnswers[i],
-        correct: !s.invalid && s.value !== ''
-      }));
+      currentAnswers = postState.inputStates.map((s, i) => {
+        let correctStatus = false;
+        if (s.isCorrect) correctStatus = true;
+        else if (s.invalid) correctStatus = false;
+        else correctStatus = (s.value !== '');
+
+        return {
+            value: s.value,
+            unit: currentAnswers[i]?.unit || 'No units',
+            correct: correctStatus,
+            isNeutral: !s.isCorrect && !s.invalid
+        };
+      });
 
       let stillWrong = currentAnswers.some(a => a.correct === false);
       const lowerTextRetry = postState.text.toLowerCase();
       const globalErrorCheck = lowerTextRetry.includes("partially correct") || lowerTextRetry.includes("incorrect");
 
-      // SAFETY NET COPIED INTO RETRY LOOP
-      if (!stillWrong && globalErrorCheck) {
-          console.warn("[Solve] Retry Loop: Global error detected but no individual invalid inputs. Forcing retry.");
-          currentAnswers.forEach(a => a.correct = false);
-          stillWrong = true;
+      if (globalErrorCheck) {
+          currentAnswers.forEach(a => {
+              if (a.isNeutral) {
+                  a.correct = false;
+                  stillWrong = true;
+              }
+          });
       }
 
       if (!stillWrong) {
