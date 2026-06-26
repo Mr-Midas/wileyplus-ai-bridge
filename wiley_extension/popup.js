@@ -1,6 +1,6 @@
 let autoNextEnabled = false;
 
-// --- UI Helpers (countdown + step bar) ---
+// --- UI Helpers ---
 
 function setStep(stepNum, state) {
   for (let i = 1; i <= 6; i++) {
@@ -37,7 +37,7 @@ function clearUI() {
   }
 }
 
-// --- Gemini Web helpers ---
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 function extractJSON(text) {
   if (!text) return null;
@@ -51,138 +51,11 @@ function extractJSON(text) {
   return null;
 }
 
-async function callGeminiWeb(problemText, inputCount, retryContext, wileyTabId) {
-  console.log("[Gemini] callGeminiWeb: inputCount =", inputCount, "retry =", !!retryContext);
-
-  // Build prompt
-  let prompt;
-  if (retryContext) {
-    prompt = `The answers you gave for this problem were checked and some were marked incorrect. Fix only the wrong ones.
-
-PROBLEM:
-${problemText}
-
-PREVIOUS ANSWERS:
-${JSON.stringify(retryContext.previousAnswers)}
-
-FEEDBACK:
-${retryContext.feedbackText}
-
-The answers marked "correct": true were accepted. DO NOT change them.
-Only fix the answers marked "correct": false.
-
-Return EXACTLY ${inputCount} answers. Return ONLY this JSON:
-{"answers":[{"value":"number","unit":"unit"},...],"reasoning":"..."}`;
-  } else {
-    prompt = `Solve this physics problem. Return EXACTLY ${inputCount} answers.
-
-Rules:
-- "value" must be ONLY a number. No ranges, no units in value.
-- "unit" must be one of: "s", "m", "m/s", "m/s^2", "cm/s^2", "No units", "km/h", "km", "min"
-
-Return ONLY this JSON (no other text):
-{"answers":[{"value":"number","unit":"unit"},...],"reasoning":"..."}
-
-PROBLEM:
-${problemText}`;
-  }
-
-  try {
-    console.log("[Gemini] Sending prompt to server /gemini-web, length:", prompt.length);
-    const response = await fetch('http://127.0.0.1:5000/gemini-web', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ prompt })
-    });
-    if (!response.ok) {
-      const err = await response.json();
-      console.log("[Gemini] Server error:", response.status, err);
-      return null;
-    }
-    const data = await response.json();
-    console.log("[Gemini] Server returned:", data.answers?.length, "answers");
-    return data;
-  } catch (e) {
-    console.log("[Gemini] Server fetch failed:", e.message);
-    return null;
-  }
+function safeStorageSet(obj) {
+  try { chrome.storage.local.set(obj); } catch {}
 }
 
-// --- Server helpers ---
-
-async function callServerSolve(text, inputCount) {
-  console.log("[Server] callServerSolve: inputCount =", inputCount);
-  const response = await fetch('http://127.0.0.1:5000/solve', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ text, input_count: inputCount })
-  });
-  if (!response.ok) {
-    const err = await response.json();
-    console.log("[Server] solve error:", response.status, err);
-    throw new Error(err.error || `Server error ${response.status}`);
-  }
-  const data = await response.json();
-  console.log("[Server] solve response, answers:", data.answers?.length);
-  return data;
-}
-
-async function callServerRetry(text, previousAnswers, feedbackText, attempt) {
-  console.log("[Server] callServerRetry: attempt =", attempt, "prevAnswers =", previousAnswers.length);
-  const response = await fetch('http://127.0.0.1:5000/retry', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ original_text: text, previous_answers: previousAnswers, feedback_text: feedbackText, attempt, input_count: previousAnswers.length })
-  });
-  if (!response.ok) {
-    console.log("[Server] retry error:", response.status);
-    throw new Error(`Retry error ${response.status}`);
-  }
-  const data = await response.json();
-  console.log("[Server] retry response, answers:", data.answers?.length, "action:", data.action);
-  return data;
-}
-
-async function checkServerAlive() {
-  try {
-    const resp = await fetch('http://127.0.0.1:5000/', { method: 'GET', signal: AbortSignal.timeout(2000) });
-    return resp.ok;
-  } catch { return false; }
-}
-
-async function callGroqDirect(text, inputCount, retryContext) {
-  let key = await new Promise(res => chrome.storage.local.get('groqKey', d => res(d.groqKey || '')));
-  if (!key) { console.log("[Groq] No API key. Set via: chrome.storage.local.set({groqKey:'your_key'})"); return null; }
-  console.log("[Groq] Calling Groq API directly...");
-  const systemMsg = retryContext
-    ? `The answers you gave were checked and some were marked incorrect. Fix only the wrong ones. Previous answers: ${JSON.stringify(retryContext.previousAnswers)}. Feedback: ${retryContext.feedbackText}. Return EXACTLY ${inputCount} answers. Return ONLY JSON: {"answers":[{"value":"number","unit":"unit"},...]}`
-    : `Solve this physics problem. Return EXACTLY ${inputCount} answers. "value" must be a number only. "unit" must be one of: s, m, m/s, m/s^2, cm/s^2, No units, km/h, km, min. Return ONLY JSON: {"answers":[{"value":"number","unit":"unit"},...],"reasoning":"..."}`;
-  const resp = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + key },
-    body: JSON.stringify({
-      model: 'llama-3.3-70b-versatile',
-      messages: [
-        { role: 'system', content: systemMsg },
-        { role: 'user', content: text }
-      ],
-      temperature: 0.1,
-      max_tokens: 2000
-    })
-  });
-  if (!resp.ok) { console.log("[Groq] API error:", resp.status); return null; }
-  const data = await resp.json();
-  const content = data.choices?.[0]?.message?.content;
-  if (!content) { console.log("[Groq] No content in response"); return null; }
-  console.log("[Groq] Raw response:", content.substring(0, 200));
-  return extractJSON(content);
-}
-
-// --- WileyPLUS interaction helpers ---
-
-function sleep(ms) {
-  return new Promise(r => setTimeout(r, ms));
-}
+// --- Scraper (broad selectors) ---
 
 async function scrapeFullState(tab) {
   console.log("[Scrape] scrapeFullState: tab =", tab.url);
@@ -190,33 +63,29 @@ async function scrapeFullState(tab) {
     target: { tabId: tab.id, allFrames: true },
     func: () => {
       const inputs = Array.from(document.querySelectorAll(
-        'input[type="text"][aria-label="Enter your answer"], input[type="number"][aria-label="Enter your answer"]'
-      ));
+        'input[type="text"]:not([readonly]):not([hidden]), input[type="number"]:not([readonly]):not([hidden])'
+      )).filter(inp => {
+        const id = (inp.id || '').toLowerCase();
+        const cls = (inp.className || '').toLowerCase();
+        return !id.includes('search') && !cls.includes('search');
+      });
+
       const states = inputs.map(inp => ({
         value: inp.value,
-        invalid: inp.getAttribute('aria-invalid') === 'true'
+        invalid: inp.getAttribute('aria-invalid') === 'true' || inp.classList.contains('invalid')
       }));
+
       let text = '';
       let isolatedCount = 0;
-
       const firstEmpty = inputs.find(inp => inp.value.trim() === '');
       if (firstEmpty) {
         let el = firstEmpty.closest('.question-content, .problem-statement, section.question, .assessment-question, [class*="question"], [class*="problem"]');
-        if (!el) {
-          el = firstEmpty.parentElement;
-          for (let i = 0; i < 20 && el && el !== document.body; i++) {
-            if (el.tagName === 'SECTION' || el.tagName === 'ARTICLE' ||
-                (el.classList.length > 0 && Array.from(el.classList).some(c => c.includes('question') || c.includes('problem')))) {
-              break;
-            }
-            el = el.parentElement;
-          }
-        }
-        if (el && el !== document.body && el !== document.documentElement) {
+        if (!el) el = firstEmpty.parentElement;
+        if (el && el !== document.body) {
           const clone = el.cloneNode(true);
           clone.querySelectorAll('script, style, nav, header, footer, .navigation, .sidebar').forEach(e => e.remove());
           text = clone.innerText;
-          isolatedCount = el.querySelectorAll('input[aria-label="Enter your answer"]').length;
+          isolatedCount = el.querySelectorAll('input[type="text"]:not([readonly]):not([hidden]), input[type="number"]:not([readonly]):not([hidden])').length;
         }
       }
       if (!text) {
@@ -235,59 +104,21 @@ async function scrapeFullState(tab) {
   };
 }
 
-function cleanAnswersExtension(answers) {
-  return answers.map(a => {
-    let val = String(a.value || '').trim();
-    const unit = String(a.unit || 'No units').trim();
-    // Strip leading +
-    if (val.startsWith('+')) val = val.slice(1);
-    // Handle ranges "45.0 to 55.0" → average
-    if (/to|–|-/.test(val)) {
-      const parts = val.match(/[\d.]+/g);
-      if (parts && parts.length >= 2) {
-        val = String((parseFloat(parts[0]) + parseFloat(parts[1])) / 2);
-      }
-    }
-    // Extract first number from mixed text like "3.00 m/s"
-    const firstNum = val.match(/[\d.]+/);
-    if (firstNum) val = firstNum[0];
-    // Fallback to empty if not numeric
-    if (isNaN(parseFloat(val))) val = '';
-    return { value: val, unit: unit, correct: a.correct };
-  });
-}
-
-function validateAnswers(answers) {
-  answers.forEach((a, i) => {
-    const val = String(a.value).trim();
-    if (val === '' || isNaN(parseFloat(val))) {
-      throw new Error(`Answer ${i+1}: "${a.value}" is not a valid number`);
-    }
-    a.value = val;
-  });
-}
-
-function safeStorageSet(obj) {
-  try { if (chrome?.storage?.local) chrome.storage.local.set(obj); } catch(e) { console.warn("[Storage] set failed:", e); }
-}
-
-function safeStorageGet(keys, cb) {
-  try { if (chrome?.storage?.local) chrome.storage.local.get(keys, cb); else cb({}); } catch(e) { console.warn("[Storage] get failed:", e); cb({}); }
-}
+// --- Fill Answers (broad selectors) ---
 
 async function fillAnswers(tab, answers) {
-  console.log("[Wiley] fillAnswers:", answers.length, "answers");
-  console.log("[Wiley] Answers:", JSON.stringify(answers));
   await chrome.scripting.executeScript({
     target: { tabId: tab.id, allFrames: true },
     func: (ans) => {
       const numberInputs = Array.from(document.querySelectorAll(
-        'input[type="text"][aria-label="Enter your answer"], input[type="number"][aria-label="Enter your answer"]'
-      ));
-      const unitSelects = Array.from(document.querySelectorAll(
-        'select[aria-label="Select your answer"]'
-      ));
-      console.log("[Wiley] fill found", numberInputs.length, "inputs,", unitSelects.length, "selects");
+        'input[type="text"]:not([readonly]):not([hidden]), input[type="number"]:not([readonly]):not([hidden])'
+      )).filter(inp => {
+        const id = (inp.id || '').toLowerCase();
+        const cls = (inp.className || '').toLowerCase();
+        return !id.includes('search') && !cls.includes('search');
+      });
+      const unitSelects = Array.from(document.querySelectorAll('select'));
+
       ans.forEach((a, i) => {
         if (numberInputs[i] && a.correct !== true) {
           numberInputs[i].value = a.value;
@@ -295,14 +126,10 @@ async function fillAnswers(tab, answers) {
           numberInputs[i].dispatchEvent(new Event('change', { bubbles: true }));
         }
         if (unitSelects[i] && a.correct !== true) {
-          const opt = Array.from(unitSelects[i].options).find(o =>
-            o.textContent.trim().toLowerCase() === a.unit.toLowerCase()
-          );
+          const opt = Array.from(unitSelects[i].options).find(o => o.textContent.trim().toLowerCase() === String(a.unit).toLowerCase());
           if (opt) {
             unitSelects[i].value = opt.value;
             unitSelects[i].dispatchEvent(new Event('change', { bubbles: true }));
-          } else {
-            console.log("[Wiley] No unit option found for:", a.unit, "in select", i);
           }
         }
       });
@@ -312,61 +139,136 @@ async function fillAnswers(tab, answers) {
 }
 
 async function checkInputsFilled(tab) {
-  console.log("[Wiley] checkInputsFilled...");
   const r = await chrome.scripting.executeScript({
     target: { tabId: tab.id, allFrames: true },
     func: () => {
-      const inputs = document.querySelectorAll('input[aria-label="Enter your answer"]');
-      const values = Array.from(inputs).map(inp => inp.value);
-      const allFilled = values.every(v => v.trim() !== '');
-      console.log("[Wiley] Input values:", JSON.stringify(values), "allFilled:", allFilled);
-      return allFilled;
+      const inputs = Array.from(document.querySelectorAll('input[aria-label="Enter your answer"]'));
+      return inputs.every(inp => inp.value && inp.value.trim() !== '');
     }
   });
-  const result = r.some(rr => rr.result === true);
-  console.log("[Wiley] checkInputsFilled result:", result);
-  return result;
+  return r.some(rr => rr.result === true);
 }
 
+// --- Server calls ---
+
+async function callServerSolve(text, inputCount) {
+  console.log("[Server] callServerSolve:", inputCount, "answers needed");
+  const response = await fetch('http://127.0.0.1:5000/solve', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ text, input_count: inputCount })
+  });
+  if (!response.ok) throw new Error(`Server error ${response.status}`);
+  return await response.json();
+}
+
+async function callServerRetry(text, previousAnswers, feedbackText, attempt) {
+  console.log("[Server] callServerRetry: attempt", attempt);
+  const response = await fetch('http://127.0.0.1:5000/retry', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ original_text: text, previous_answers: previousAnswers, feedback_text: feedbackText, attempt, input_count: previousAnswers.length })
+  });
+  if (!response.ok) throw new Error(`Retry error ${response.status}`);
+  return await response.json();
+}
+
+async function callGeminiWeb(problemText, inputCount, retryContext, wileyTabId) {
+  console.log("[Gemini] callGeminiWeb via server /gemini-web");
+  let prompt;
+  if (retryContext) {
+    prompt = `The answers you gave for this problem were checked and some were marked incorrect. Fix only the wrong ones.\n\nPROBLEM:\n${problemText}\n\nPREVIOUS ANSWERS:\n${JSON.stringify(retryContext.previousAnswers)}\n\nFEEDBACK:\n${retryContext.feedbackText}\n\nThe answers marked "correct": true were accepted. DO NOT change them.\nOnly fix the answers marked "correct": false.\n\nReturn EXACTLY ${inputCount} answers. Return ONLY this JSON:\n{"answers":[{"value":"number","unit":"unit"},...],"reasoning":"..."}`;
+  } else {
+    prompt = `Solve this physics problem. Return EXACTLY ${inputCount} answers.\n\nRules:\n- "value" must be ONLY a number. No ranges, no units in value.\n- "unit" must be one of: "s", "m", "m/s", "m/s^2", "cm/s^2", "No units", "km/h", "km", "min"\n\nReturn ONLY this JSON (no other text):\n{"answers":[{"value":"number","unit":"unit"},...],"reasoning":"..."}\n\nPROBLEM:\n${problemText}`;
+  }
+  try {
+    const response = await fetch('http://127.0.0.1:5000/gemini-web', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ prompt })
+    });
+    if (!response.ok) return null;
+    return await response.json();
+  } catch (e) {
+    console.log("[Gemini] Server fetch failed:", e.message);
+    return null;
+  }
+}
+
+async function callGroqDirect(text, inputCount, retryContext) {
+  let key = await new Promise(res => chrome.storage.local.get('groqKey', d => res(d.groqKey || '')));
+  if (!key) return null;
+  console.log("[Groq] Calling API directly...");
+  const systemMsg = retryContext
+    ? `Fix wrong answers. Previous: ${JSON.stringify(retryContext.previousAnswers)}. Feedback: ${retryContext.feedbackText}. Return EXACTLY ${inputCount} answers. JSON: {"answers":[{"value":"number","unit":"unit"},...]}`
+    : `Solve physics. Return EXACTLY ${inputCount} answers. "value"=number only, "unit"=s|m|m/s|m/s^2|cm/s^2|No units|km/h|km|min. JSON: {"answers":[{"value":"number","unit":"unit"},...],"reasoning":"..."}`;
+  const resp = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + key },
+    body: JSON.stringify({ model: 'llama-3.3-70b-versatile', messages: [{ role: 'system', content: systemMsg }, { role: 'user', content: text }], temperature: 0.1, max_tokens: 2000 })
+  });
+  if (!resp.ok) return null;
+  const data = await resp.json();
+  return extractJSON(data.choices?.[0]?.message?.content);
+}
+
+async function checkServerAlive() {
+  try { const r = await fetch('http://127.0.0.1:5000/', { signal: AbortSignal.timeout(2000) }); return r.ok; } catch { return false; }
+}
+
+// --- Answer cleaning ---
+
+function cleanAnswersExtension(answers) {
+  return answers.map(a => {
+    let val = String(a.value || '').trim();
+    const unit = String(a.unit || 'No units').trim();
+    if (val.startsWith('+')) val = val.slice(1);
+    if (/to|–|-/.test(val)) {
+      const parts = val.match(/[\d.]+/g);
+      if (parts && parts.length >= 2) val = String((parseFloat(parts[0]) + parseFloat(parts[1])) / 2);
+    }
+    const firstNum = val.match(/[\d.]+/);
+    if (firstNum) val = firstNum[0];
+    if (isNaN(parseFloat(val))) val = '';
+    return { value: val, unit, correct: a.correct };
+  });
+}
+
+function validateAnswers(answers) {
+  answers.forEach((a, i) => {
+    const val = String(a.value).trim();
+    if (val === '' || isNaN(parseFloat(val))) throw new Error(`Answer ${i+1}: "${a.value}" is not a valid number`);
+    a.value = val;
+  });
+}
+
+// --- Submit & Next ---
+
 async function clickSubmit(tab) {
-  console.log("[Wiley] clickSubmit...");
   const r = await chrome.scripting.executeScript({
     target: { tabId: tab.id, allFrames: true },
     func: () => {
       const selectors = [
         'button.btn.btn-primary.was-submit-answer.m-l-h',
         'button.was-submit-answer',
-        'button.btn-primary.was-submit-answer',
         'button[data-testid="submit-answer"]',
-        'button[aria-label="Submit Answer"]',
-        'button[aria-label="Submit"]',
-        '.was-submit-answer',
-        'button.btn-primary[type="submit"]',
-        'input[type="submit"].btn-primary',
-        'button:has-text("Submit Answer")',
-        'button:has-text("Submit")'
+        'button[aria-label*="Submit"]',
+        '.submit-button',
+        'button.MuiButton-root[type="submit"]'
       ];
       for (const sel of selectors) {
         try {
           const btn = document.querySelector(sel);
-          if (btn && btn.offsetParent !== null) {
-            console.log("[Wiley] Submit button found via:", sel, "text:", btn.innerText?.trim());
-            btn.click();
-            return { success: true, selector: sel };
-          }
+          if (btn && btn.offsetParent !== null) { btn.click(); return { success: true, selector: sel }; }
         } catch {}
       }
-      console.log("[Wiley] Submit button NOT found with any selector");
       return { success: false };
     }
   });
-  const clicked = r.some(rr => rr.result?.success === true);
-  console.log("[Wiley] clickSubmit result:", clicked);
-  return r;
+  return r.some(rr => rr.result?.success === true);
 }
 
 async function clickSubmitFallback(tab) {
-  console.log("[Wiley] clickSubmitFallback: trying alternative selectors...");
   const r = await chrome.scripting.executeScript({
     target: { tabId: tab.id, allFrames: true },
     func: () => {
@@ -376,21 +278,15 @@ async function clickSubmitFallback(tab) {
         'button[type="submit"]',
         'input[type="submit"]',
         '[role="button"][aria-label*="Submit"]',
-        'button:has-text("Submit")',
         '.submit-button',
         'button.MuiButton-root[type="submit"]'
       ];
       for (const sel of selectors) {
         try {
           const btn = document.querySelector(sel);
-          if (btn && btn.offsetParent !== null) {
-            console.log("[Wiley] Fallback found via:", sel, "text:", btn.innerText?.trim());
-            btn.click();
-            return true;
-          }
+          if (btn && btn.offsetParent !== null) { btn.click(); return true; }
         } catch {}
       }
-      console.log("[Wiley] All fallback selectors failed");
       return false;
     }
   });
@@ -398,7 +294,6 @@ async function clickSubmitFallback(tab) {
 }
 
 async function clickNext(tab) {
-  console.log("[Wiley] clickNext...");
   const r = await chrome.scripting.executeScript({
     target: { tabId: tab.id, allFrames: true },
     func: () => {
@@ -411,9 +306,7 @@ async function clickNext(tab) {
         'button.MuiButtonBase-root[title="Next question"]',
         'path[d="M10 6L8.59 7.41 13.17 12l-4.58 4.59L10 18l6-6z"]',
         '.MuiIconButton-root[title="Next question"]',
-        'button[title*="Next"]',
-        'a[title="Next question"]',
-        '[data-testid="next"]'
+        'button[title*="Next"]'
       ];
       for (const sel of selectors) {
         try {
@@ -422,124 +315,98 @@ async function clickNext(tab) {
             const path = document.querySelector(sel);
             if (path) btn = path.closest('button, a, [role="button"]');
           }
-          if (btn && btn.offsetParent !== null) {
-            console.log("[Wiley] Next button found via:", sel);
-            btn.click();
-            return { success: true, selector: sel };
-          }
+          if (btn && btn.offsetParent !== null) { btn.click(); return { success: true }; }
         } catch {}
       }
-      console.log("[Wiley] Next button NOT found with any selector");
       return { success: false };
     }
   });
-  const result = r.some(rr => rr.result?.success === true);
-  console.log("[Wiley] clickNext result:", result);
-  return r;
+  return r.some(rr => rr.result?.success === true);
 }
+
+// --- Auto debug ---
 
 async function autoDebugPage(tab) {
   console.log("[AutoDebug] Running backend page inspection...");
   const r = await chrome.scripting.executeScript({
     target: { tabId: tab.id, allFrames: true },
     func: () => {
-      const inputs = Array.from(document.querySelectorAll('input[aria-label="Enter your answer"], textarea[aria-label="Enter your answer"]')).map((inp, i) => ({
-        index: i, tag: inp.tagName, type: inp.type, ariaLabel: inp.getAttribute('aria-label'),
-        value: inp.value, classes: inp.className, id: inp.id,
-        selector: inp.tagName.toLowerCase() + '[aria-label="Enter your answer"]'
+      const inputs = Array.from(document.querySelectorAll('input[type="text"], input[type="number"]')).map((inp, i) => ({
+        index: i, type: inp.type, ariaLabel: inp.getAttribute('aria-label'), value: inp.value, classes: inp.className, id: inp.id
       }));
       const submitBtns = Array.from(document.querySelectorAll('button, input[type="submit"]')).map((btn, i) => ({
-        index: i, tag: btn.tagName, text: btn.innerText?.trim(), classes: btn.className, id: btn.id,
-        ariaLabel: btn.getAttribute('aria-label'), visible: btn.offsetParent !== null
+        index: i, tag: btn.tagName, text: btn.innerText?.trim(), classes: btn.className, visible: btn.offsetParent !== null
       }));
       return { inputs, submitBtns };
     }
   });
-  const data = r[0]?.result;
-  if (data) {
-    console.log("[AutoDebug] DIAGNOSTICS GENERATED:", data);
-    safeStorageSet({ lastAutoDebug: { timestamp: new Date().toLocaleTimeString(), data } });
+  if (r[0]?.result) {
+    safeStorageSet({ lastAutoDebug: { timestamp: new Date().toLocaleTimeString(), data: r[0].result } });
+    console.log("[AutoDebug] DIAGNOSTICS SAVED");
   }
 }
 
+// --- Get tabs ---
+
+async function getWileyTab() {
+  const patterns = ['*://*.wiley.com/*', '*://*.wileyplus.com/*', '*://*.wileyplus.knowmia.com/*'];
+  for (const p of patterns) {
+    const tabs = await chrome.tabs.query({ url: p });
+    if (tabs.length > 0) return tabs[0];
+  }
+  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  if (tab && tab.url && !tab.url.includes('gemini.google.com')) return tab;
+  return tab;
+}
+
 async function handleSuccess(answers, status, resultDiv, wileyTab) {
-  console.log("[Wiley] handleSuccess:", answers.length, "answers, all correct");
   const text = answers.map(a => `${a.value} ${a.unit}`).join('\n');
   status.innerText = "All correct!";
   resultDiv.innerText = text;
   resultDiv.style.display = "block";
   safeStorageSet({ lastResult: { text, timestamp: new Date().toLocaleTimeString() } });
   if (autoNextEnabled) {
-    console.log("[Wiley] Auto-next enabled, clicking next...");
     status.innerText = "All correct! Moving to next...";
-    resultDiv.innerText = text + "\n\n[Auto-next: clicking next...]";
     await sleep(1500);
     const nextResult = await clickNext(wileyTab);
-    const clicked = nextResult.some(r => r.result === "next_clicked");
-    if (clicked) {
-      console.log("[Wiley] Auto-next succeeded");
+    if (nextResult.some(r => r.result?.success)) {
       status.innerText = "Moved to next question.";
-      resultDiv.innerText = text + "\n\n[Auto-next: moved to next question]";
     } else {
-      console.log("[Wiley] Auto-next: button not found");
       resultDiv.innerText = text + "\n\n[Auto-next: next button not found]";
     }
   }
 }
 
-async function getWileyTab() {
-  console.log("[Wiley] getWileyTab: searching for WileyPLUS tab...");
-  const patterns = ['*://*.wiley.com/*', '*://*.wileyplus.com/*', '*://*.wileyplus.knowmia.com/*'];
-  for (const p of patterns) {
-    const tabs = await chrome.tabs.query({ url: p });
-    if (tabs.length > 0) {
-      console.log("[Wiley] Found tab via pattern", p, ":", tabs[0].url);
-      return tabs[0];
-    }
-  }
-  // Fallback: use active tab but reject if it's gemini
-  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-  if (tab && tab.url && !tab.url.includes('gemini.google.com')) {
-    console.log("[Wiley] Using active tab:", tab.url);
-    return tab;
-  }
-  console.log("[Wiley] No WileyPLUS tab found, returning active tab anyway");
-  return tab;
-}
-
-// --- MAIN SOLVE FLOW ---
+// --- MAIN SOLVE ---
 
 async function solve() {
   const status = document.getElementById('status');
   const btn = document.getElementById('solveBtn');
   const resultDiv = document.getElementById('result');
-
   btn.disabled = true;
   resultDiv.style.display = "none";
 
   try {
     const tab = await getWileyTab();
-    if (!tab) {
-      console.log("[Solve] No Wiley tab found");
-      throw new Error("No WileyPLUS tab open. Open a WileyPLUS problem first.");
-    }
+    if (!tab) throw new Error("No WileyPLUS tab open. Open a problem first.");
+
+    setStep(1, 'active');
     status.innerText = "Scraping...";
-    console.log("[Solve] Scraping tab:", tab.url);
     const state = await scrapeFullState(tab);
-    console.log("[Solve] Scraped: text length =", state.text.length, "inputCount =", state.inputCount, "inputStates =", state.inputStates.length);
-    if (!state.text || state.text.trim().length === 0) {
-      throw new Error("Could not find any text on the page.");
+    if (!state.text || state.text.trim().length === 0) throw new Error("Could not find any text on the page.");
+    if (state.inputCount === 0) {
+      await autoDebugPage(tab);
+      throw new Error("Found 0 input fields. Debug data saved.");
     }
 
-    // --- Get answers: try Gemini web first, fallback to Groq direct or server ---
+    setStep(2, 'active');
     status.innerText = "Asking Gemini (web)...";
-    console.log("[Solve] Calling Gemini web...");
     let data = await callGeminiWeb(state.text, state.inputCount, undefined, tab.id);
     let usedGemini = !!data;
-    console.log("[Solve] Gemini web returned:", usedGemini ? "answers:" + data.answers.length : "null");
 
     if (!data || !data.answers) {
-      console.log("[Solve] Gemini unavailable, trying direct Groq...");
+      console.log("[Solve] Gemini unavailable, trying Groq direct...");
+      setStep(2, 'active');
       status.innerText = "Gemini unavailable, using Groq...";
       data = await callGroqDirect(state.text, state.inputCount);
       usedGemini = false;
@@ -548,63 +415,52 @@ async function solve() {
     if (!data || !data.answers) {
       const serverAlive = await checkServerAlive();
       if (serverAlive) {
+        setStep(2, 'active');
         status.innerText = "Groq unavailable, using server...";
-        console.log("[Solve] Falling back to server...");
         data = await callServerSolve(state.text, state.inputCount);
-        console.log("[Solve] Server returned:", data ? "answers:" + data.answers.length : "null");
       } else {
-        console.log("[Solve] Server not running, cannot fall back");
-        status.innerText = "Server not running! Click 'Start Server'.";
+        throw new Error("No AI available. Start the server or set a Groq key.");
       }
-    } else {
-      status.innerText = "Gemini answered. Filling...";
     }
 
-    if (!data || !data.answers) throw new Error("AI returned no answers");
-    console.log("[Solve] Cleaning and validating answers...");
+    if (!data || !data.answers) throw new Error("AI returned no answers.");
+
+    setStep(3, 'active');
     data.answers = cleanAnswersExtension(data.answers);
     validateAnswers(data.answers);
-    console.log("[Solve] Answers cleaned:", data.answers.length);
 
+    setStep(4, 'active');
+    status.innerText = "Filling answers...";
     await fillAnswers(tab, data.answers);
-    console.log("[Solve] Answers filled");
 
-    // Pre-submit validation — retry fill up to 3 times if inputs are empty
+    // Pre-submit fill retry
     let filled = false;
     for (let fillAttempt = 0; fillAttempt < 3; fillAttempt++) {
       if (fillAttempt > 0) {
         console.log("[Solve] Re-filling attempt", fillAttempt + 1);
         await fillAnswers(tab, data.answers);
-        await sleep(1000);
       }
+      await sleep(1500);
       filled = await checkInputsFilled(tab);
-      console.log("[Solve] Pre-submit fill check:", filled ? "all filled" : "some empty");
       if (filled) break;
     }
-    if (!filled) {
-      status.innerText = "Some inputs empty after 3 attempts, retrying via AI...";
-      console.log("[Solve] Inputs still empty after 3 retries, fall through to retry");
-    } else {
-      status.innerText = "Submitting...";
-      console.log("[Solve] Clicking submit...");
-      const submitResult = await clickSubmit(tab);
-      const submitClicked = submitResult.some(r => r.result === true);
-      console.log("[Solve] Submit clicked:", submitClicked);
-      if (!submitClicked) {
-        // Try fallback submit selectors
-        const fbResult = await clickSubmitFallback(tab);
-        console.log("[Solve] Fallback submit result:", fbResult);
-        // Auto-debug on submit failure
-        if (!fbResult) {
-          console.warn("[Solve] All submit buttons failed, triggering auto-debug...");
-          await autoDebugPage(tab);
-        }
+
+    setStep(5, 'active');
+    status.innerText = "Submitting...";
+    const submitResult = await clickSubmit(tab);
+    const submitClicked = submitResult;
+    if (!submitClicked) {
+      const fbResult = await clickSubmitFallback(tab);
+      if (!fbResult) {
+        console.warn("[Solve] All submit buttons failed, triggering auto-debug...");
+        await autoDebugPage(tab);
       }
-      await sleep(7000);
     }
 
+    await sleep(7000);
+
+    // Check results
     let postState = await scrapeFullState(tab);
-    console.log("[Solve] Post-submit state: inputStates =", postState.inputStates.length);
     while (data.answers.length < postState.inputStates.length) {
       data.answers.push({ value: '', unit: 'No units' });
     }
@@ -612,50 +468,31 @@ async function solve() {
       ...data.answers[i],
       correct: !s.invalid && s.value !== ''
     }));
-    console.log("[Solve] Answers after submit:", currentAnswers.map(a => a.value + "[" + (a.correct ? "OK" : "WRONG") + "]"));
 
     let hadErrors = currentAnswers.some(a => a.correct === false);
     if (!hadErrors) {
-      console.log("[Solve] All correct!");
+      setStep(6, 'done');
       await handleSuccess(currentAnswers, status, resultDiv, tab);
       return;
     }
-    console.log("[Solve] Had errors, entering retry loop");
 
-    // --- Retry loop ---
+    // Retry loop
     for (let attempt = 1; attempt <= 3; attempt++) {
       status.innerText = `Retry ${attempt}: fixing wrong answers...`;
-      console.log("[Solve] Retry attempt", attempt);
-
       let retryData;
       if (usedGemini) {
-        console.log("[Solve] Retry via Gemini web...");
-        retryData = await callGeminiWeb(state.text, state.inputCount, {
-          previousAnswers: currentAnswers,
-          feedbackText: postState.text
-        }, tab.id);
-        console.log("[Solve] Gemini retry returned:", retryData ? "answers:" + (retryData.answers?.length) : "null");
+        retryData = await callGeminiWeb(state.text, state.inputCount, { previousAnswers: currentAnswers, feedbackText: postState.text }, tab.id);
       }
       if (!retryData || !retryData.answers) {
-        console.log("[Solve] Retry via direct Groq...");
-        retryData = await callGroqDirect(state.text, state.inputCount, {
-          previousAnswers: currentAnswers,
-          feedbackText: postState.text
-        });
+        const serverAlive = await checkServerAlive();
+        if (serverAlive) {
+          retryData = await callServerRetry(state.text, currentAnswers, postState.text, attempt);
+        }
       }
-      if (!retryData || !retryData.answers) {
-        console.log("[Solve] Retry via server...");
-        retryData = await callServerRetry(state.text, currentAnswers, postState.text, attempt);
-        console.log("[Solve] Server retry returned:", retryData ? "answers:" + (retryData.answers?.length) : "null");
-      }
+      if (!retryData || !retryData.answers) break;
 
-      if (!retryData || !retryData.answers) {
-        console.log("[Solve] Retry returned no answers, breaking");
-        break;
-      }
       retryData.answers = cleanAnswersExtension(retryData.answers);
       if (retryData.action === 'done' || currentAnswers.every(a => a.correct === true)) {
-        console.log("[Solve] Retry done action or all correct");
         await handleSuccess(currentAnswers, status, resultDiv, tab);
         return;
       }
@@ -669,142 +506,74 @@ async function solve() {
         return { ...retryData.answers[i], correct: false };
       });
 
-      console.log("[Solve] Filling retry answers...");
       await fillAnswers(tab, currentAnswers);
-      const filledRetry = await checkInputsFilled(tab);
-      console.log("[Solve] Retry fill check:", filledRetry ? "all filled" : "some empty");
-      if (!filledRetry) {
-        status.innerText = `Retry ${attempt}: inputs still empty, re-asking...`;
-        continue;
-      }
-      console.log("[Solve] Clicking submit (retry)...");
+      await sleep(1500);
+      const retryFilled = await checkInputsFilled(tab);
+      if (!retryFilled) continue;
+
       let retrySubmitResult = await clickSubmit(tab);
-      if (!retrySubmitResult.some(r => r.result === true)) {
+      if (!retrySubmitResult) {
         retrySubmitResult = await clickSubmitFallback(tab);
         if (!retrySubmitResult) {
-          console.warn("[Solve] Retry submit failed, triggering auto-debug...");
           await autoDebugPage(tab);
         }
       }
       await sleep(7000);
 
       postState = await scrapeFullState(tab);
-      console.log("[Solve] Post-retry state:", postState.inputStates.length, "inputs");
-      while (currentAnswers.length < postState.inputStates.length) {
-        currentAnswers.push({ value: '', unit: 'No units', correct: false });
-      }
       currentAnswers = postState.inputStates.map((s, i) => ({
         ...currentAnswers[i],
         correct: !s.invalid && s.value !== ''
       }));
-      console.log("[Solve] Retry result:", currentAnswers.map(a => a.value + "[" + (a.correct ? "OK" : "WRONG") + "]"));
 
-      const stillWrong = currentAnswers.some(a => a.correct === false);
-      if (!stillWrong) {
-        console.log("[Solve] All correct after retry!");
+      if (currentAnswers.every(a => a.correct === true)) {
         await handleSuccess(currentAnswers, status, resultDiv, tab);
         return;
       }
-      console.log("[Solve] Still wrong after retry", attempt);
     }
 
-    status.innerText = "Some still wrong.";
-    console.log("[Solve] Final state:", currentAnswers.map(a => a.value + " " + a.unit + " [" + (a.correct ? "OK" : "WRONG") + "]"));
-    resultDiv.innerText = "Final status:\n" +
-      currentAnswers.map(a => `${a.value} ${a.unit} [${a.correct ? 'OK' : 'WRONG'}]`).join('\n') +
-      "\n\nCheck manually.";
+    setStep(6, 'error');
+    status.innerText = "Some answers still wrong after retries.";
+    resultDiv.innerText = currentAnswers.map(a => `${a.value} ${a.unit} [${a.correct ? 'OK' : 'WRONG'}]`).join('\n');
     resultDiv.style.display = "block";
-    safeStorageSet({ lastResult: { text: resultDiv.innerText, timestamp: new Date().toLocaleTimeString() } });
 
   } catch (e) {
-    console.log("[Solve] ERROR:", e.message, e.stack);
     status.innerText = "Error";
-    resultDiv.innerText = e.message + "\n\n[Open popup console: right-click → Inspect]";
+    resultDiv.innerText = e.message;
     resultDiv.style.display = "block";
     console.error(e);
   } finally {
     btn.disabled = false;
+    setTimeout(clearUI, 3000);
   }
 }
 
-// --- Popup setup ---
+// --- Init ---
 
 document.addEventListener('DOMContentLoaded', () => {
-  const toggle = document.getElementById('autoNextToggle');
-  const serverDot = document.getElementById('serverDot');
-  const serverLabel = document.getElementById('serverLabel');
-  safeStorageGet(['lastResult', 'autoNext'], d => {
-    if (d.autoNext !== undefined) {
-      autoNextEnabled = d.autoNext;
-      toggle.checked = d.autoNext;
-    }
-    if (d.lastResult) {
-      document.getElementById('status').innerText = `Last (${d.lastResult.timestamp})`;
-      document.getElementById('result').innerText = d.lastResult.text;
-      document.getElementById('result').style.display = 'block';
-    }
-  });
-  toggle.addEventListener('change', () => {
-    autoNextEnabled = toggle.checked;
-    safeStorageSet({ autoNext: toggle.checked });
-  });
-  checkServerAlive().then(alive => {
-    serverDot.className = 'dot ' + (alive ? 'green' : 'red');
-    serverLabel.textContent = alive ? 'Server: running' : 'Server: offline (using Groq direct)';
-  });
-});
+  document.getElementById('solveBtn').addEventListener('click', solve);
 
-// Debug function to inspect page selectors
-async function debugPage() {
-  const status = document.getElementById('status');
-  const resultDiv = document.getElementById('result');
-  const tab = await getWileyTab();
-  if (!tab) { status.innerText = "No Wiley tab"; return; }
-  
-  status.innerText = "Inspecting page...";
-  const r = await chrome.scripting.executeScript({
-    target: { tabId: tab.id, allFrames: true },
-    func: () => {
-      const inputs = Array.from(document.querySelectorAll('input[aria-label="Enter your answer"], textarea[aria-label="Enter your answer"]')).map((inp, i) => ({
-        index: i, tag: inp.tagName, type: inp.type, ariaLabel: inp.getAttribute('aria-label'),
-        value: inp.value, classes: inp.className, id: inp.id, selector: inp.tagName.toLowerCase() + '[aria-label="Enter your answer"]'
-      }));
-      const selects = Array.from(document.querySelectorAll('select[aria-label="Select your answer"]')).map((sel, i) => ({
-        index: i, ariaLabel: sel.getAttribute('aria-label'), options: Array.from(sel.options).map(o => o.textContent.trim()),
-        classes: sel.className, id: sel.id
-      }));
-      const submitBtns = Array.from(document.querySelectorAll('button, input[type="submit"]')).map((btn, i) => ({
-        index: i, tag: btn.tagName, type: btn.type, text: btn.innerText?.trim(), classes: btn.className, id: btn.id,
-        ariaLabel: btn.getAttribute('aria-label'), title: btn.title, testid: btn.getAttribute('data-testid'),
-        visible: btn.offsetParent !== null, selector: btn.tagName.toLowerCase() + (btn.id ? '#' + btn.id : '') + (btn.className ? '.' + btn.className.split(' ').join('.') : '')
-      }));
-      const nextBtns = Array.from(document.querySelectorAll('button, a')).filter(el => 
-        el.title?.includes('Next') || el.getAttribute('aria-label')?.includes('Next') || 
-        el.innerText?.includes('Next') || el.getAttribute('data-testid')?.includes('next')
-      ).map((btn, i) => ({
-        index: i, tag: btn.tagName, text: btn.innerText?.trim(), classes: btn.className, id: btn.id,
-        title: btn.title, ariaLabel: btn.getAttribute('aria-label'), testid: btn.getAttribute('data-testid'),
-        visible: btn.offsetParent !== null
-      }));
-      return { inputs, selects, submitBtns, nextBtns };
-    }
-  });
-  const data = r[0]?.result;
-  if (data) {
-    console.log("[Debug] Inputs:", data.inputs);
-    console.log("[Debug] Selects:", data.selects);
-    console.log("[Debug] Submit buttons:", data.submitBtns);
-    console.log("[Debug] Next buttons:", data.nextBtns);
-    resultDiv.innerText = "INPUTS:\n" + JSON.stringify(data.inputs, null, 2) +
-      "\n\nSELECTS:\n" + JSON.stringify(data.selects, null, 2) +
-      "\n\nSUBMIT BUTTONS:\n" + JSON.stringify(data.submitBtns, null, 2) +
-      "\n\nNEXT BUTTONS:\n" + JSON.stringify(data.nextBtns, null, 2);
-    resultDiv.style.display = 'block';
-    status.innerText = "Debug complete - check console & result";
-  } else {
-    status.innerText = "Debug failed - no data returned";
+  // Auto-next toggle
+  const autoNextToggle = document.getElementById('autoNextToggle');
+  if (autoNextToggle) {
+    chrome.storage.local.get('autoNextEnabled', d => {
+      autoNextEnabled = !!d.autoNextEnabled;
+      autoNextToggle.checked = autoNextEnabled;
+    });
+    autoNextToggle.addEventListener('change', () => {
+      autoNextEnabled = autoNextToggle.checked;
+      safeStorageSet({ autoNextEnabled });
+    });
   }
-}
 
-document.getElementById('solveBtn').addEventListener('click', solve);
-document.getElementById('debugBtn').addEventListener('click', debugPage);
+  // Server status check
+  async function checkServer() {
+    const dot = document.getElementById('serverDot');
+    const label = document.getElementById('serverLabel');
+    const alive = await checkServerAlive();
+    if (dot) dot.className = alive ? 'dot green' : 'dot red';
+    if (label) label.textContent = alive ? 'Server: connected' : 'Server: offline';
+  }
+  checkServer();
+  setInterval(checkServer, 10000);
+});

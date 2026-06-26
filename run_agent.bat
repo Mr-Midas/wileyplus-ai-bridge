@@ -3,7 +3,7 @@ title Wiley AI Bridge Server
 cd /d "%~dp0"
 
 echo ============================================
-echo  WileyPLUS AI Bridge Server v7.0
+echo  WileyPLUS AI Bridge Server v7.1
 echo ============================================
 echo.
 
@@ -16,18 +16,17 @@ echo Checking dependencies...
 python -m pip install flask flask-cors requests python-dotenv google-generativeai playwright >nul 2>&1
 
 echo Launching Chrome with remote debugging...
-set CHROME_PATH="C:\Program Files\Google\Chrome\Application\chrome.exe"
-set USER_DATA="C:\Users\thome\AppData\Local\Google\Chrome\User Data"
-start "" %CHROME_PATH% --remote-debugging-port=9222 --user-data-dir=%USER_DATA%
+:: Chrome uses your default logged-in profile automatically
+start "" "C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9222
 echo Chrome started. Waiting for it to load...
 timeout /t 5 /nobreak >nul
 
-echo Starting Bridge Server v7.0 on port 5000...
+echo Starting Bridge Server v7.1 on port 5000...
 echo.
 python bridge_server.py
 if %ERRORLEVEL% NEQ 0 (
     echo.
-    echo [!] THE SERVER CRASHED. 
+    echo [!] THE SERVER CRASHED.
     echo Please check if you have Python installed correctly.
 )
 pause
