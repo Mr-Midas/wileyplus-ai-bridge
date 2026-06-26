@@ -1,6 +1,7 @@
 import os
 import re
 import json
+import asyncio
 import requests
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -118,6 +119,63 @@ def solve_with_priority(prompt, retry_context=None):
             continue
     return None
 
+async def call_gemini_web(prompt_text):
+    """Connect to Chrome via CDP, send prompt to Gemini web, extract JSON response."""
+    from playwright.async_api import async_playwright
+
+    async with async_playwright() as p:
+        browser = await p.chromium.connect_over_cdp("http://127.0.0.1:9222")
+        context = browser.contexts[0]
+        page = None
+
+        for pg in context.pages:
+            if "gemini.google.com" in pg.url:
+                page = pg
+                break
+
+        if not page:
+            page = await context.new_page()
+            await page.goto("https://gemini.google.com/app/a4cd531f81f6f26d")
+            await page.wait_for_load_state("networkidle")
+
+        # Inject prompt via execCommand (instant, no char-by-char)
+        await page.evaluate("""(text) => {
+            const el = document.querySelector('div[contenteditable="true"][role="textbox"]');
+            if (el) {
+                el.focus();
+                document.execCommand('insertText', false, text);
+            }
+        }""", prompt_text)
+
+        # Click send button
+        send_selectors = [
+            'button[aria-label="Send message"]',
+            'button[data-testid="send-button"]',
+            'mat-icon[fonticon="arrow_upward"]'
+        ]
+        for sel in send_selectors:
+            try:
+                btn = page.locator(sel).first
+                if await btn.is_visible(timeout=2000):
+                    await btn.click()
+                    break
+            except:
+                continue
+
+        # Wait for JSON in code blocks
+        for _ in range(30):
+            await asyncio.sleep(2)
+            code_blocks = await page.locator('code[data-test-id="code-content"]').all()
+            for block in code_blocks:
+                text = await block.inner_text()
+                if '{"answers"' in text or '{"action"' in text:
+                    import re as regex
+                    match = regex.search(r'\{.*\}', text, regex.DOTALL)
+                    if match:
+                        return json.loads(match.group())
+
+        return None
+
 @app.route('/solve', methods=['POST'])
 def solve():
     data = request.json
@@ -230,10 +288,10 @@ Return an EXTRA field in your JSON called "diagnostics_alert" containing a short
         return jsonify(result)
     return jsonify({"error": "All retry models failed", "action": "failed"}), 500
 
-@app.route('/gemini-web', methods=['POST'])
+@app.route('/gemini-web', methods=['GET', 'POST'])
 def gemini_web():
     """Proxy to Gemini web via Playwright."""
-    data = request.json
+    data = request.json or {}
     prompt_text = data.get('prompt', '')
     if not prompt_text:
         return jsonify({"error": "No prompt"}), 400
@@ -250,7 +308,6 @@ def health():
     return jsonify({"status": "ok", "version": "7.1"})
 
 if __name__ == "__main__":
-    import asyncio
     print("="*50)
     print(" WILEY BRIDGE v7.1 (Dynamic Dropdowns & Smart Retry)")
     print(" Endpoints: /solve, /retry, /gemini-web, /")
