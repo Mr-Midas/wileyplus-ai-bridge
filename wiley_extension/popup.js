@@ -55,13 +55,14 @@ function safeStorageSet(obj) {
   try { chrome.storage.local.set(obj); } catch {}
 }
 
-// --- Scraper (broad selectors) ---
+// --- Scraper (aggressive, with unit options) ---
 
 async function scrapeFullState(tab) {
   console.log("[Scrape] scrapeFullState: tab =", tab.url);
   const results = await chrome.scripting.executeScript({
     target: { tabId: tab.id, allFrames: true },
     func: () => {
+      // Get visible text/number inputs
       const inputs = Array.from(document.querySelectorAll(
         'input[type="text"]:not([readonly]):not([hidden]), input[type="number"]:not([readonly]):not([hidden])'
       )).filter(inp => {
@@ -70,13 +71,33 @@ async function scrapeFullState(tab) {
         return !id.includes('search') && !cls.includes('search');
       });
 
-      const states = inputs.map(inp => ({
-        value: inp.value,
-        invalid: inp.getAttribute('aria-invalid') === 'true' || inp.classList.contains('invalid')
-      }));
+      // Get dropdown unit options
+      const selects = Array.from(document.querySelectorAll('select:not([hidden])'));
+      const selectOptions = selects.map(sel =>
+        Array.from(sel.options)
+          .map(o => o.textContent.trim())
+          .filter(t => t && t.toLowerCase() !== 'select an option' && t !== '---' && t !== '')
+      );
+
+      // Aggressively check for wrong/invalid indicators
+      const states = inputs.map(inp => {
+        const parent = inp.closest('label, div, td, tr, .question-content');
+        const invalidAttr = inp.getAttribute('aria-invalid') === 'true';
+
+        // Search surrounding HTML for error flags
+        const html = parent ? parent.innerHTML.toLowerCase() : inp.outerHTML.toLowerCase();
+        const hasWrongIcon = html.includes('fa-times') || html.includes('incorrect') || html.includes('wrong') || html.includes('error');
+        const classInvalid = /invalid|incorrect|wrong|error/i.test(inp.className) || (parent && /invalid|incorrect|wrong|error/i.test(parent.className));
+
+        return {
+          value: inp.value,
+          invalid: invalidAttr || classInvalid || hasWrongIcon
+        };
+      });
 
       let text = '';
       let isolatedCount = 0;
+
       const firstEmpty = inputs.find(inp => inp.value.trim() === '');
       if (firstEmpty) {
         let el = firstEmpty.closest('.question-content, .problem-statement, section.question, .assessment-question, [class*="question"], [class*="problem"]');
@@ -88,23 +109,25 @@ async function scrapeFullState(tab) {
           isolatedCount = el.querySelectorAll('input[type="text"]:not([readonly]):not([hidden]), input[type="number"]:not([readonly]):not([hidden])').length;
         }
       }
+
       if (!text) {
         const cloned = document.body.cloneNode(true);
         cloned.querySelectorAll('script, style, nav, header, footer, .navigation, .sidebar').forEach(e => e.remove());
         text = cloned.innerText;
       }
-      return JSON.stringify({ text, inputStates: states, inputCount: isolatedCount || inputs.length });
+      return JSON.stringify({ text, inputStates: states, inputCount: isolatedCount || inputs.length, unitOptions: selectOptions });
     }
   });
   const parsed = results.map(r => JSON.parse(r.result));
   return {
     text: parsed.map(p => p.text).filter(t => t).join("\n\n--- Frame Boundary ---\n\n"),
     inputStates: parsed.flatMap(p => p.inputStates),
-    inputCount: Math.max(...parsed.filter(p => p.text).map(p => p.inputCount), 0)
+    inputCount: Math.max(...parsed.filter(p => p.text).map(p => p.inputCount), 0),
+    unitOptions: parsed.flatMap(p => p.unitOptions)
   };
 }
 
-// --- Fill Answers (broad selectors) ---
+// --- Fill Answers ---
 
 async function fillAnswers(tab, answers) {
   await chrome.scripting.executeScript({
@@ -117,7 +140,7 @@ async function fillAnswers(tab, answers) {
         const cls = (inp.className || '').toLowerCase();
         return !id.includes('search') && !cls.includes('search');
       });
-      const unitSelects = Array.from(document.querySelectorAll('select'));
+      const unitSelects = Array.from(document.querySelectorAll('select:not([hidden])'));
 
       ans.forEach((a, i) => {
         if (numberInputs[i] && a.correct !== true) {
@@ -151,35 +174,36 @@ async function checkInputsFilled(tab) {
 
 // --- Server calls ---
 
-async function callServerSolve(text, inputCount) {
-  console.log("[Server] callServerSolve:", inputCount, "answers needed");
+async function callServerSolve(text, inputCount, unitOptions) {
+  console.log("[Server] callServerSolve:", inputCount, "answers, unit options:", unitOptions.length);
   const response = await fetch('http://127.0.0.1:5000/solve', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ text, input_count: inputCount })
+    body: JSON.stringify({ text, input_count: inputCount, unit_options: unitOptions })
   });
   if (!response.ok) throw new Error(`Server error ${response.status}`);
   return await response.json();
 }
 
-async function callServerRetry(text, previousAnswers, feedbackText, attempt) {
+async function callServerRetry(text, previousAnswers, feedbackText, attempt, inputCount, unitOptions) {
   console.log("[Server] callServerRetry: attempt", attempt);
   const response = await fetch('http://127.0.0.1:5000/retry', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ original_text: text, previous_answers: previousAnswers, feedback_text: feedbackText, attempt, input_count: previousAnswers.length })
+    body: JSON.stringify({ original_text: text, previous_answers: previousAnswers, feedback_text: feedbackText, attempt, input_count: inputCount, unit_options: unitOptions })
   });
   if (!response.ok) throw new Error(`Retry error ${response.status}`);
   return await response.json();
 }
 
-async function callGeminiWeb(problemText, inputCount, retryContext, wileyTabId) {
+async function callGeminiWeb(problemText, inputCount, retryContext, wileyTabId, unitOptions) {
   console.log("[Gemini] callGeminiWeb via server /gemini-web");
   let prompt;
+  const unitHint = unitOptions && unitOptions.length > 0 ? `\nUnit options: ${JSON.stringify(unitOptions)}` : '';
   if (retryContext) {
-    prompt = `The answers you gave for this problem were checked and some were marked incorrect. Fix only the wrong ones.\n\nPROBLEM:\n${problemText}\n\nPREVIOUS ANSWERS:\n${JSON.stringify(retryContext.previousAnswers)}\n\nFEEDBACK:\n${retryContext.feedbackText}\n\nThe answers marked "correct": true were accepted. DO NOT change them.\nOnly fix the answers marked "correct": false.\n\nReturn EXACTLY ${inputCount} answers. Return ONLY this JSON:\n{"answers":[{"value":"number","unit":"unit"},...],"reasoning":"..."}`;
+    prompt = `The answers you gave for this problem were checked and some were marked incorrect. Fix only the wrong ones.\n\nPROBLEM:\n${problemText}\n\nPREVIOUS ANSWERS:\n${JSON.stringify(retryContext.previousAnswers)}\n\nFEEDBACK:\n${retryContext.feedbackText}\n\nThe answers marked "correct": true were accepted. DO NOT change them.\nOnly fix the answers marked "correct": false.\n\nReturn EXACTLY ${inputCount} answers. Return ONLY this JSON:\n{"answers":[{"value":"number","unit":"unit"},...],"reasoning":"..."}${unitHint}`;
   } else {
-    prompt = `Solve this physics problem. Return EXACTLY ${inputCount} answers.\n\nRules:\n- "value" must be ONLY a number. No ranges, no units in value.\n- "unit" must be one of: "s", "m", "m/s", "m/s^2", "cm/s^2", "No units", "km/h", "km", "min"\n\nReturn ONLY this JSON (no other text):\n{"answers":[{"value":"number","unit":"unit"},...],"reasoning":"..."}\n\nPROBLEM:\n${problemText}`;
+    prompt = `Solve this physics problem. Return EXACTLY ${inputCount} answers.\n\nRules:\n- "value" must be ONLY a number. No ranges, no units in value.\n- "unit" must match one of the provided options exactly.${unitHint}\n\nReturn ONLY this JSON (no other text):\n{"answers":[{"value":"number","unit":"unit"},...],"reasoning":"..."}\n\nPROBLEM:\n${problemText}`;
   }
   try {
     const response = await fetch('http://127.0.0.1:5000/gemini-web', {
@@ -195,13 +219,14 @@ async function callGeminiWeb(problemText, inputCount, retryContext, wileyTabId) 
   }
 }
 
-async function callGroqDirect(text, inputCount, retryContext) {
+async function callGroqDirect(text, inputCount, retryContext, unitOptions) {
   let key = await new Promise(res => chrome.storage.local.get('groqKey', d => res(d.groqKey || '')));
   if (!key) return null;
   console.log("[Groq] Calling API directly...");
+  const unitHint = unitOptions && unitOptions.length > 0 ? ` Unit options: ${JSON.stringify(unitOptions)}` : '';
   const systemMsg = retryContext
-    ? `Fix wrong answers. Previous: ${JSON.stringify(retryContext.previousAnswers)}. Feedback: ${retryContext.feedbackText}. Return EXACTLY ${inputCount} answers. JSON: {"answers":[{"value":"number","unit":"unit"},...]}`
-    : `Solve physics. Return EXACTLY ${inputCount} answers. "value"=number only, "unit"=s|m|m/s|m/s^2|cm/s^2|No units|km/h|km|min. JSON: {"answers":[{"value":"number","unit":"unit"},...],"reasoning":"..."}`;
+    ? `Fix wrong answers. Previous: ${JSON.stringify(retryContext.previousAnswers)}. Feedback: ${retryContext.feedbackText}. Return EXACTLY ${inputCount} answers.${unitHint} JSON: {"answers":[{"value":"number","unit":"unit"},...]}`
+    : `Solve physics. Return EXACTLY ${inputCount} answers. "value"=number only, "unit"=one of the provided options.${unitHint} JSON: {"answers":[{"value":"number","unit":"unit"},...],"reasoning":"..."}`;
   const resp = await fetch('https://api.groq.com/openai/v1/chat/completions', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + key },
@@ -221,7 +246,7 @@ async function checkServerAlive() {
 function cleanAnswersExtension(answers) {
   return answers.map(a => {
     let val = String(a.value || '').trim();
-    const unit = String(a.unit || 'No units').trim();
+    const unit = a.unit;
     if (val.startsWith('+')) val = val.slice(1);
     if (/to|–|-/.test(val)) {
       const parts = val.match(/[\d.]+/g);
@@ -278,8 +303,7 @@ async function clickSubmitFallback(tab) {
         'button[type="submit"]',
         'input[type="submit"]',
         '[role="button"][aria-label*="Submit"]',
-        '.submit-button',
-        'button.MuiButton-root[type="submit"]'
+        '.submit-button'
       ];
       for (const sel of selectors) {
         try {
@@ -304,17 +328,12 @@ async function clickNext(tab) {
         'button[aria-label="Next"]',
         'button.MuiIconButton-root[title="Next question"]',
         'button.MuiButtonBase-root[title="Next question"]',
-        'path[d="M10 6L8.59 7.41 13.17 12l-4.58 4.59L10 18l6-6z"]',
         '.MuiIconButton-root[title="Next question"]',
         'button[title*="Next"]'
       ];
       for (const sel of selectors) {
         try {
           let btn = document.querySelector(sel);
-          if (!btn && sel.startsWith('path[')) {
-            const path = document.querySelector(sel);
-            if (path) btn = path.closest('button, a, [role="button"]');
-          }
           if (btn && btn.offsetParent !== null) { btn.click(); return { success: true }; }
         } catch {}
       }
@@ -398,17 +417,18 @@ async function solve() {
       await autoDebugPage(tab);
       throw new Error("Found 0 input fields. Debug data saved.");
     }
+    console.log("[Solve] Scraped:", state.inputCount, "inputs, unit options:", state.unitOptions);
 
     setStep(2, 'active');
     status.innerText = "Asking Gemini (web)...";
-    let data = await callGeminiWeb(state.text, state.inputCount, undefined, tab.id);
+    let data = await callGeminiWeb(state.text, state.inputCount, undefined, tab.id, state.unitOptions);
     let usedGemini = !!data;
 
     if (!data || !data.answers) {
       console.log("[Solve] Gemini unavailable, trying Groq direct...");
       setStep(2, 'active');
       status.innerText = "Gemini unavailable, using Groq...";
-      data = await callGroqDirect(state.text, state.inputCount);
+      data = await callGroqDirect(state.text, state.inputCount, null, state.unitOptions);
       usedGemini = false;
     }
 
@@ -417,7 +437,7 @@ async function solve() {
       if (serverAlive) {
         setStep(2, 'active');
         status.innerText = "Groq unavailable, using server...";
-        data = await callServerSolve(state.text, state.inputCount);
+        data = await callServerSolve(state.text, state.inputCount, state.unitOptions);
       } else {
         throw new Error("No AI available. Start the server or set a Groq key.");
       }
@@ -448,8 +468,7 @@ async function solve() {
     setStep(5, 'active');
     status.innerText = "Submitting...";
     const submitResult = await clickSubmit(tab);
-    const submitClicked = submitResult;
-    if (!submitClicked) {
+    if (!submitResult) {
       const fbResult = await clickSubmitFallback(tab);
       if (!fbResult) {
         console.warn("[Solve] All submit buttons failed, triggering auto-debug...");
@@ -459,7 +478,7 @@ async function solve() {
 
     await sleep(7000);
 
-    // Check results
+    // Post-submit verification
     let postState = await scrapeFullState(tab);
     while (data.answers.length < postState.inputStates.length) {
       data.answers.push({ value: '', unit: 'No units' });
@@ -470,6 +489,16 @@ async function solve() {
     }));
 
     let hadErrors = currentAnswers.some(a => a.correct === false);
+
+    // Safety net: check for global "partially correct" / "incorrect" text
+    const lowerText = postState.text.toLowerCase();
+    const hasGlobalError = lowerText.includes("partially correct") || lowerText.includes("incorrect");
+    if (!hadErrors && hasGlobalError) {
+      console.warn("[Solve] No inputs flagged invalid, but global error found. Forcing retry.");
+      currentAnswers.forEach(a => a.correct = false);
+      hadErrors = true;
+    }
+
     if (!hadErrors) {
       setStep(6, 'done');
       await handleSuccess(currentAnswers, status, resultDiv, tab);
@@ -481,12 +510,12 @@ async function solve() {
       status.innerText = `Retry ${attempt}: fixing wrong answers...`;
       let retryData;
       if (usedGemini) {
-        retryData = await callGeminiWeb(state.text, state.inputCount, { previousAnswers: currentAnswers, feedbackText: postState.text }, tab.id);
+        retryData = await callGeminiWeb(state.text, state.inputCount, { previousAnswers: currentAnswers, feedbackText: postState.text }, tab.id, state.unitOptions);
       }
       if (!retryData || !retryData.answers) {
         const serverAlive = await checkServerAlive();
         if (serverAlive) {
-          retryData = await callServerRetry(state.text, currentAnswers, postState.text, attempt);
+          retryData = await callServerRetry(state.text, currentAnswers, postState.text, attempt, state.inputCount, state.unitOptions);
         }
       }
       if (!retryData || !retryData.answers) break;
@@ -508,15 +537,11 @@ async function solve() {
 
       await fillAnswers(tab, currentAnswers);
       await sleep(1500);
-      const retryFilled = await checkInputsFilled(tab);
-      if (!retryFilled) continue;
 
       let retrySubmitResult = await clickSubmit(tab);
       if (!retrySubmitResult) {
         retrySubmitResult = await clickSubmitFallback(tab);
-        if (!retrySubmitResult) {
-          await autoDebugPage(tab);
-        }
+        if (!retrySubmitResult) await autoDebugPage(tab);
       }
       await sleep(7000);
 
@@ -526,15 +551,18 @@ async function solve() {
         correct: !s.invalid && s.value !== ''
       }));
 
-      if (currentAnswers.every(a => a.correct === true)) {
+      const stillWrong = currentAnswers.some(a => a.correct === false);
+      const globalErrorCheck = postState.text.toLowerCase().includes("partially correct") || postState.text.toLowerCase().includes("incorrect");
+      if (!stillWrong && !globalErrorCheck) {
+        setStep(6, 'done');
         await handleSuccess(currentAnswers, status, resultDiv, tab);
         return;
       }
     }
 
     setStep(6, 'error');
-    status.innerText = "Some answers still wrong after retries.";
-    resultDiv.innerText = currentAnswers.map(a => `${a.value} ${a.unit} [${a.correct ? 'OK' : 'WRONG'}]`).join('\n');
+    status.innerText = "Some still wrong.";
+    resultDiv.innerText = "Final status:\n" + currentAnswers.map(a => `${a.value} ${a.unit} [${a.correct ? 'OK' : 'WRONG'}]`).join('\n') + "\n\nCheck manually.";
     resultDiv.style.display = "block";
 
   } catch (e) {
@@ -553,7 +581,6 @@ async function solve() {
 document.addEventListener('DOMContentLoaded', () => {
   document.getElementById('solveBtn').addEventListener('click', solve);
 
-  // Auto-next toggle
   const autoNextToggle = document.getElementById('autoNextToggle');
   if (autoNextToggle) {
     chrome.storage.local.get('autoNextEnabled', d => {
@@ -566,7 +593,6 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   }
 
-  // Server status check
   async function checkServer() {
     const dot = document.getElementById('serverDot');
     const label = document.getElementById('serverLabel');
