@@ -65,11 +65,26 @@ async function scrapeFullState(tab) {
   const results = await chrome.scripting.executeScript({
     target: { tabId: tab.id, allFrames: true },
     func: () => {
-      // Get Inputs (ignore search bars)
+      // 1. SMART ATTEMPT TRACKER
+      let attemptsUsed = 0;
+      let attemptsTotal = 3; // Default safe fallback
+      const bodyText = document.body.innerText.replace(/\n/g, ' ');
+
+      // Matches "Attempts: 1 of 5 used", "Used: 1/5", etc.
+      const match1 = bodyText.match(/(?:attempts?|used)[^\d]*(\d+)\s*(?:of|\/)\s*(\d+)/i);
+      // Matches "1 of 5 attempts used"
+      const match2 = bodyText.match(/(\d+)\s*(?:of|\/)\s*(\d+)[^\d]*(?:attempts?|used)/i);
+      const attemptMatch = match1 || match2;
+
+      if (attemptMatch) {
+        attemptsUsed = parseInt(attemptMatch[1], 10);
+        attemptsTotal = parseInt(attemptMatch[2], 10);
+      }
+
+      // 2. INPUT SCRAPING
       const inputs = Array.from(document.querySelectorAll('input[type="text"]:not([readonly]):not([hidden]), input[type="number"]:not([readonly]):not([hidden])'))
         .filter(inp => !inp.id.toLowerCase().includes('search') && !inp.className.toLowerCase().includes('search'));
 
-      // Get Dropdown Units
       const selects = Array.from(document.querySelectorAll('select'));
       const selectOptions = selects.map(sel =>
         Array.from(sel.options)
@@ -77,21 +92,18 @@ async function scrapeFullState(tab) {
           .filter(t => t && t.toLowerCase() !== 'select an option' && t !== '---' && t !== '')
       );
 
-      // SMART DOM INSPECTION: Distinguish between Right, Wrong, and Neutral
+      // 3. SMART DOM INSPECTION (Correct/Incorrect indicators)
       const states = inputs.map(inp => {
         const parent = inp.closest('label, div, td, tr, .question-content');
         const html = parent ? parent.innerHTML.toLowerCase() : inp.outerHTML.toLowerCase();
 
-        // Check for explicit "Wrong" indicators
         const invalidAttr = inp.getAttribute('aria-invalid') === 'true';
         const hasWrongIcon = html.includes('fa-times') || html.includes('incorrect') || html.includes('wrong') || html.includes('error');
         const classInvalid = /invalid|incorrect|wrong|error/i.test(inp.className) || (parent && /invalid|incorrect|wrong|error/i.test(parent.className));
 
-        // Check for explicit "Correct" indicators
         const hasCorrectIcon = html.includes('fa-check') || html.includes('correct') || html.includes('right');
         const classCorrect = /correct|valid|success/i.test(inp.className) || (parent && /correct|valid|success/i.test(parent.className));
 
-        // Final logic (Ensures 'partially correct' doesn't accidentally flag a specific input as wrong)
         const isActuallyWrong = (invalidAttr || classInvalid || hasWrongIcon) && !html.includes('partially correct');
         const isActuallyRight = (hasCorrectIcon || classCorrect) && !isActuallyWrong;
 
@@ -102,6 +114,7 @@ async function scrapeFullState(tab) {
         };
       });
 
+      // 4. TEXT EXTRACTION
       let text = '';
       let isolatedCount = 0;
 
@@ -122,15 +135,37 @@ async function scrapeFullState(tab) {
         cloned.querySelectorAll('script, style, nav, header, footer, .navigation, .sidebar').forEach(e => e.remove());
         text = cloned.innerText;
       }
-      return JSON.stringify({ text, inputStates: states, inputCount: isolatedCount || inputs.length, unitOptions: selectOptions });
+
+      return JSON.stringify({
+          text,
+          inputStates: states,
+          inputCount: isolatedCount || inputs.length,
+          unitOptions: selectOptions,
+          attemptsUsed,
+          attemptsTotal
+      });
     }
   });
+
   const parsed = results.map(r => JSON.parse(r.result));
+
+  // Resolve cross-frame attempts
+  let finalAttemptsUsed = 0;
+  let finalAttemptsTotal = 3;
+  parsed.forEach(p => {
+      if (p.attemptsTotal > 0 && p.attemptsTotal !== 3 || p.attemptsUsed > 0) {
+          finalAttemptsUsed = Math.max(finalAttemptsUsed, p.attemptsUsed);
+          finalAttemptsTotal = Math.max(finalAttemptsTotal, p.attemptsTotal);
+      }
+  });
+
   return {
     text: parsed.map(p => p.text).filter(t => t).join("\n\n--- Frame Boundary ---\n\n"),
     inputStates: parsed.flatMap(p => p.inputStates),
     inputCount: Math.max(...parsed.filter(p => p.text).map(p => p.inputCount), 0),
-    unitOptions: parsed.flatMap(p => p.unitOptions)
+    unitOptions: parsed.flatMap(p => p.unitOptions),
+    attemptsUsed: finalAttemptsUsed,
+    attemptsTotal: finalAttemptsTotal
   };
 }
 
@@ -143,7 +178,6 @@ async function fillAnswers(tab, answers) {
       const unitSelects = Array.from(document.querySelectorAll('select'));
 
       ans.forEach((a, i) => {
-        // Only attempt fill if it's NOT explicitly marked correct AND we actually have a real value
         let safeVal = String(a.value || '').trim();
         if (safeVal.toLowerCase() === 'undefined' || safeVal.toLowerCase() === 'null') safeVal = '';
 
@@ -199,8 +233,6 @@ function cleanAnswersExtension(answers) {
   return answers.map(a => {
     if (!a) return { value: '', unit: 'No units', correct: false };
     let val = String(a.value || '').trim();
-
-    // Nuke AI hallucinations
     if (val.toLowerCase() === 'undefined' || val.toLowerCase() === 'null') val = '';
 
     if (val.startsWith('+')) val = val.slice(1);
@@ -238,25 +270,6 @@ async function getWileyTab() {
 }
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
-
-// --- Background Diagnostics Generator ---
-async function autoDebugPage(tab) {
-  const r = await chrome.scripting.executeScript({
-    target: { tabId: tab.id, allFrames: true },
-    func: () => {
-      const inputs = Array.from(document.querySelectorAll('input[type="text"], input[type="number"]')).map((inp, i) => ({
-        index: i, ariaLabel: inp.getAttribute('aria-label'), value: inp.value, classes: inp.className, id: inp.id
-      }));
-      const submitBtns = Array.from(document.querySelectorAll('button, input[type="submit"]')).map((btn, i) => ({
-        index: i, text: btn.innerText?.trim(), classes: btn.className, visible: btn.offsetParent !== null
-      }));
-      return { inputs, submitBtns };
-    }
-  });
-  if (r[0]?.result) {
-    chrome.storage.local.set({ lastAutoDebug: { timestamp: new Date().toLocaleTimeString(), data: r[0].result } });
-  }
-}
 
 // --- Submit & Verify Logic ---
 async function verifyAllFilled(tab) {
@@ -296,6 +309,7 @@ async function solve() {
 
   btn.disabled = true;
   resultDiv.style.display = "none";
+  let lastDiagnosticAlert = null;
 
   try {
     const tab = await getWileyTab();
@@ -305,11 +319,15 @@ async function solve() {
     const state = await scrapeFullState(tab);
 
     if (state.inputCount === 0) {
-      await autoDebugPage(tab);
-      throw new Error("Could not find any text inputs. Debug data saved to background.");
+      throw new Error("Could not find any text inputs.");
     }
 
-    status.innerText = "Asking Backend Server...";
+    // SAFETY BLOCK: Max attempts already reached before we even start
+    if (state.attemptsUsed >= state.attemptsTotal && state.attemptsTotal > 0) {
+        throw new Error(`Safety Abort: ${state.attemptsUsed}/${state.attemptsTotal} attempts used. You are out of attempts!`);
+    }
+
+    status.innerText = `Attempts Left: ${state.attemptsTotal - state.attemptsUsed}. Asking Server...`;
     let data = await callServerSolve(state.text, state.inputCount, state.unitOptions);
 
     if (!data || !data.answers) throw new Error("Server returned no answers");
@@ -326,21 +344,17 @@ async function solve() {
     }
 
     status.innerText = "Submitting...";
-    const submitResult = await clickSubmit(tab);
-    if (!submitResult) await autoDebugPage(tab);
+    await clickSubmit(tab);
     await sleep(7000);
 
-    // ---------------------------------------------
     // POST-SUBMIT VERIFICATION & RETRY LOGIC
-    // ---------------------------------------------
     let postState = await scrapeFullState(tab);
 
-    // Build state based strictly on physical DOM markers
     let currentAnswers = postState.inputStates.map((s, i) => {
         let correctStatus = false;
-        if (s.isCorrect) correctStatus = true; // Lock in explicit correct answers
-        else if (s.invalid) correctStatus = false; // Lock in explicit wrong answers
-        else correctStatus = (s.value !== ''); // Neutral but filled
+        if (s.isCorrect) correctStatus = true;
+        else if (s.invalid) correctStatus = false;
+        else correctStatus = (s.value !== '');
 
         return {
             value: s.value,
@@ -350,13 +364,12 @@ async function solve() {
         };
     });
 
-    // Safety Net: Only invalidate neutral answers if "partially correct" is detected
     const lowerText = postState.text.toLowerCase();
     const hasGlobalError = lowerText.includes("partially correct") || lowerText.includes("incorrect");
 
     if (hasGlobalError) {
         currentAnswers.forEach(a => {
-            if (a.isNeutral) a.correct = false; // Never touches a.correct if it had a green check!
+            if (a.isNeutral) a.correct = false;
         });
     }
 
@@ -366,25 +379,36 @@ async function solve() {
       return;
     }
 
-    // RETRY LOOP
-    let lastDiagnosticAlert = null;
-    for (let attempt = 1; attempt <= 3; attempt++) {
-      status.innerText = `Retry ${attempt}: fixing wrong answers...`;
+    // CALCULATE REMAINING RETRIES
+    let retriesAllowed = postState.attemptsTotal - postState.attemptsUsed;
+    if (retriesAllowed > 5) retriesAllowed = 5; // Cap to prevent runaway loops
 
-      // Run deep diagnostics on attempt 3
+    if (retriesAllowed <= 0) {
+        status.innerText = "No attempts left.";
+        resultDiv.innerText = "Final status:\n" + currentAnswers.map(a => `${a.value} ${a.unit} [${a.correct ? 'OK' : 'WRONG'}]`).join('\n') + "\n\nMaximum attempts reached.";
+        resultDiv.style.display = "block";
+        return;
+    }
+
+    // DYNAMIC RETRY LOOP
+    for (let attempt = 1; attempt <= retriesAllowed; attempt++) {
+      status.innerText = `Retry ${attempt}/${retriesAllowed}: fixing wrong answers...`;
+
+      // Trigger diagnostics on the FINAL allowed attempt, OR on attempt 3 (whichever comes first)
       let diagnostics = null;
-      if (attempt === 3) {
-        status.innerText = "Attempt 3: Running Deep DOM Diagnostics...";
-        diagnostics = await getAdvancedDiagnostics(tab);
+      const triggerDiagnostics = (attempt === retriesAllowed) || (attempt === 3);
+
+      if (triggerDiagnostics) {
+          status.innerText = `Retry ${attempt}/${retriesAllowed}: Running Deep DOM Diagnostics...`;
+          diagnostics = await getAdvancedDiagnostics(tab);
       }
 
       let retryData = await callServerRetry(state.text, currentAnswers, postState.text, attempt, state.inputCount, state.unitOptions, diagnostics);
       if (!retryData || !retryData.answers) break;
 
-      // Save AI diagnostic alert if it generated one
       if (retryData.diagnostics_alert) {
-        lastDiagnosticAlert = retryData.diagnostics_alert;
-        console.warn("[AI DOM ANALYSIS]", lastDiagnosticAlert);
+          lastDiagnosticAlert = retryData.diagnostics_alert;
+          console.warn("[AI DOM ANALYSIS]", lastDiagnosticAlert);
       }
 
       retryData.answers = cleanAnswersExtension(retryData.answers);
@@ -393,12 +417,10 @@ async function solve() {
         return;
       }
 
-      // Enforce length and validity
       validateAnswers(retryData.answers, state.inputCount);
 
-      // Merge fixes carefully without ruining correct answers
       currentAnswers = currentAnswers.map((old, i) => {
-          if (old.correct === true) return old; // Lock
+          if (old.correct === true) return old;
           const newAns = retryData.answers[i];
           if (!newAns || newAns.value === '' || newAns.value === undefined) return old;
           return { value: newAns.value, unit: newAns.unit, correct: false, isNeutral: old.isNeutral };
@@ -451,9 +473,8 @@ async function solve() {
     status.innerText = "Some still wrong.";
     let finalOutput = "Final status:\n" + currentAnswers.map(a => `${a.value} ${a.unit} [${a.correct ? 'OK' : 'WRONG'}]`).join('\n') + "\n\nCheck manually.";
 
-    // Display the AI's DOM analysis directly in the extension UI
     if (lastDiagnosticAlert) {
-      finalOutput = "AI SYSTEM ANALYSIS:\n" + lastDiagnosticAlert + "\n\n" + finalOutput;
+        finalOutput = "AI SYSTEM ANALYSIS:\n" + lastDiagnosticAlert + "\n\n" + finalOutput;
     }
 
     resultDiv.innerText = finalOutput;
@@ -462,6 +483,9 @@ async function solve() {
   } catch (e) {
     status.innerText = "Error";
     resultDiv.innerText = e.message;
+    if (lastDiagnosticAlert) {
+        resultDiv.innerText = "AI SYSTEM ANALYSIS:\n" + lastDiagnosticAlert + "\n\nError: " + e.message;
+    }
     resultDiv.style.display = "block";
   } finally {
     btn.disabled = false;
